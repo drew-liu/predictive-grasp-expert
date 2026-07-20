@@ -1132,6 +1132,75 @@ def resolve_method_name(args):
     }[args.variant]
 
 
+def get_phase_gains(phase: str, args):
+    """Return xyz position/velocity/feedforward gains for a control phase."""
+    if phase == "observe":
+        return (
+            np.array([0.0, 0.0, args.kp_z_pre], dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+        )
+    if phase == "go_wait":
+        return (
+            np.array([args.kp_xy_pre * 1.20, args.kp_xy_pre * 1.20, args.kp_z_pre], dtype=np.float32),
+            np.array([args.kv_xy_sync * 0.15, args.kv_xy_sync * 0.15, args.kv_z_sync * 0.10], dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+        )
+    if phase == "wait_hold":
+        return (
+            np.array([args.kp_xy_pre, args.kp_xy_pre, args.kp_z_pre], dtype=np.float32),
+            np.array([args.kv_xy_sync * 0.08, args.kv_xy_sync * 0.08, args.kv_z_sync * 0.08], dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+        )
+    if phase == "launch":
+        return (
+            np.array([
+                args.kp_xy_sync * args.launch_kp_x_scale,
+                args.kp_xy_sync * args.launch_kp_y_scale,
+                args.kp_z_sync * 0.35,
+            ], dtype=np.float32),
+            np.array([
+                args.kv_xy_sync * args.launch_kv_x_scale,
+                args.kv_xy_sync * args.launch_kv_y_scale,
+                args.kv_z_sync * 0.25,
+            ], dtype=np.float32),
+            np.array([
+                args.ff_xy_sync * args.launch_ff_x_scale,
+                args.ff_xy_sync * args.launch_ff_y_scale,
+                args.ff_z_sync * 0.20,
+            ], dtype=np.float32),
+        )
+    if phase == "descend":
+        return (
+            np.array([
+                args.kp_xy_sync * args.descend_kp_x_scale,
+                args.kp_xy_sync * args.descend_kp_y_scale,
+                args.kp_z_sync * args.descend_kp_z_scale,
+            ], dtype=np.float32),
+            np.array([
+                args.kv_xy_sync * args.descend_kv_x_scale,
+                args.kv_xy_sync * args.descend_kv_y_scale,
+                args.kv_z_sync * args.descend_kv_z_scale,
+            ], dtype=np.float32),
+            np.array([
+                args.ff_xy_sync * args.descend_ff_x_scale,
+                args.ff_xy_sync * args.descend_ff_y_scale,
+                args.ff_z_sync * args.descend_ff_z_scale,
+            ], dtype=np.float32),
+        )
+    if phase == "close":
+        return (
+            np.array([args.kp_xy_sync, args.kp_xy_sync, args.kp_z_sync], dtype=np.float32),
+            np.array([args.kv_xy_sync, args.kv_xy_sync, args.kv_z_sync], dtype=np.float32),
+            np.array([args.ff_xy_sync, args.ff_xy_sync, 0.0], dtype=np.float32),
+        )
+    return (
+        np.array([args.kp_xy_sync, args.kp_xy_sync, args.kp_z_sync], dtype=np.float32),
+        np.array([args.kv_xy_sync, args.kv_xy_sync, args.kv_z_sync], dtype=np.float32),
+        np.array([args.post_ff_xy, args.post_ff_xy, 0.0], dtype=np.float32),
+    )
+
+
 def main():
     ap = build_arg_parser()
     args = ap.parse_args()
@@ -1565,58 +1634,7 @@ def main():
         vy_dbg_i = 0.0
 
         if phase in ("observe", "go_wait", "wait_hold", "launch", "descend", "close", "post_grasp"):
-            if phase == "observe":
-                kp_xyz = np.array([0.0, 0.0, args.kp_z_pre], dtype=np.float32)
-                kv_xyz = np.zeros(3, dtype=np.float32)
-                ff_xyz = np.zeros(3, dtype=np.float32)
-            elif phase == "go_wait":
-                kp_xyz = np.array([args.kp_xy_pre * 1.20, args.kp_xy_pre * 1.20, args.kp_z_pre], dtype=np.float32)
-                kv_xyz = np.array([args.kv_xy_sync * 0.15, args.kv_xy_sync * 0.15, args.kv_z_sync * 0.10], dtype=np.float32)
-                ff_xyz = np.zeros(3, dtype=np.float32)
-            elif phase == "wait_hold":
-                kp_xyz = np.array([args.kp_xy_pre, args.kp_xy_pre, args.kp_z_pre], dtype=np.float32)
-                kv_xyz = np.array([args.kv_xy_sync * 0.08, args.kv_xy_sync * 0.08, args.kv_z_sync * 0.08], dtype=np.float32)
-                ff_xyz = np.zeros(3, dtype=np.float32)
-            elif phase == "launch":
-                kp_xyz = np.array([
-                    args.kp_xy_sync * args.launch_kp_x_scale,
-                    args.kp_xy_sync * args.launch_kp_y_scale,
-                    args.kp_z_sync * 0.35,
-                ], dtype=np.float32)
-                kv_xyz = np.array([
-                    args.kv_xy_sync * args.launch_kv_x_scale,
-                    args.kv_xy_sync * args.launch_kv_y_scale,
-                    args.kv_z_sync * 0.25,
-                ], dtype=np.float32)
-                ff_xyz = np.array([
-                    args.ff_xy_sync * args.launch_ff_x_scale,
-                    args.ff_xy_sync * args.launch_ff_y_scale,
-                    args.ff_z_sync * 0.20,
-                ], dtype=np.float32)
-            elif phase == "descend":
-                kp_xyz = np.array([
-                    args.kp_xy_sync * args.descend_kp_x_scale,
-                    args.kp_xy_sync * args.descend_kp_y_scale,
-                    args.kp_z_sync * args.descend_kp_z_scale,
-                ], dtype=np.float32)
-                kv_xyz = np.array([
-                    args.kv_xy_sync * args.descend_kv_x_scale,
-                    args.kv_xy_sync * args.descend_kv_y_scale,
-                    args.kv_z_sync * args.descend_kv_z_scale,
-                ], dtype=np.float32)
-                ff_xyz = np.array([
-                    args.ff_xy_sync * args.descend_ff_x_scale,
-                    args.ff_xy_sync * args.descend_ff_y_scale,
-                    args.ff_z_sync * args.descend_ff_z_scale,
-                ], dtype=np.float32)
-            elif phase == "close":
-                kp_xyz = np.array([args.kp_xy_sync, args.kp_xy_sync, args.kp_z_sync], dtype=np.float32)
-                kv_xyz = np.array([args.kv_xy_sync, args.kv_xy_sync, args.kv_z_sync], dtype=np.float32)
-                ff_xyz = np.array([args.ff_xy_sync, args.ff_xy_sync, 0.0], dtype=np.float32)
-            else:
-                kp_xyz = np.array([args.kp_xy_sync, args.kp_xy_sync, args.kp_z_sync], dtype=np.float32)
-                kv_xyz = np.array([args.kv_xy_sync, args.kv_xy_sync, args.kv_z_sync], dtype=np.float32)
-                ff_xyz = np.array([args.post_ff_xy, args.post_ff_xy, 0.0], dtype=np.float32)
+            kp_xyz, kv_xyz, ff_xyz = get_phase_gains(phase, args)
 
             u_xyz, pos_err_vec, vel_err_vec = control_xyz(
                 ref_pos=ref_pos,
