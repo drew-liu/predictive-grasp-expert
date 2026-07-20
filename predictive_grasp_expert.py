@@ -897,8 +897,6 @@ def build_close_schedule():
     return np.array([+1.0, +0.7, +0.4, +0.1, -0.1, -0.25, -0.45, -0.65, -0.82, -1.0], dtype=np.float32)
 
 
-
-# ---------- experiment logging helpers ----------
 def _safe_float(x):
     try:
         return float(x)
@@ -952,6 +950,7 @@ def _max_abs(rows, key):
         except Exception:
             pass
     return max(vals) if vals else float("nan")
+
 
 
 def build_arg_parser():
@@ -1199,6 +1198,21 @@ def get_phase_gains(phase: str, args):
         np.array([args.kv_xy_sync, args.kv_xy_sync, args.kv_z_sync], dtype=np.float32),
         np.array([args.post_ff_xy, args.post_ff_xy, 0.0], dtype=np.float32),
     )
+
+
+def get_axis_scale(phase: str, args):
+    """Return action scaling for the current control phase."""
+    if phase == "go_wait" and args.fast_go_wait:
+        scale = np.array([args.go_wait_move_scale, args.go_wait_move_scale, args.go_wait_move_scale], dtype=np.float32)
+    else:
+        scale = np.array([args.move_scale, args.move_scale, args.move_scale], dtype=np.float32)
+
+    if phase == "launch":
+        scale[1] *= args.launch_y_action_scale
+    elif phase == "descend":
+        scale[1] *= args.descend_y_action_scale
+        scale[2] *= args.descend_z_action_scale
+    return scale
 
 
 def main():
@@ -1646,15 +1660,7 @@ def main():
                 ff_xyz=ff_xyz,
                 max_cmd=1.0,
             )
-            if phase == "go_wait" and args.fast_go_wait:
-                axis_scale = np.array([args.go_wait_move_scale, args.go_wait_move_scale, args.go_wait_move_scale], dtype=np.float32)
-            else:
-                axis_scale = np.array([args.move_scale, args.move_scale, args.move_scale], dtype=np.float32)
-            if phase == "launch":
-                axis_scale[1] *= args.launch_y_action_scale
-            elif phase == "descend":
-                axis_scale[1] *= args.descend_y_action_scale
-                axis_scale[2] *= args.descend_z_action_scale
+            axis_scale = get_axis_scale(phase, args)
             action[:3] = u_xyz * axis_scale
 
             # During descend, prevent the z controller from creeping down
