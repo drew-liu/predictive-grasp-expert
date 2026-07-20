@@ -1122,16 +1122,21 @@ def create_env_and_reset(args):
     )
     return env
 
+def resolve_method_name(args):
+    if args.method_name != "predictive_grasp_expert":
+        return args.method_name
+    return {
+        "predictive_intercept": "predictive_intercept",
+        "linear_sync": "predictive_linear_sync",
+        "full_sync": "predictive_full_sync",
+    }[args.variant]
+
+
 def main():
     ap = build_arg_parser()
     args = ap.parse_args()
 
-    if args.method_name == "predictive_grasp_expert":
-        args.method_name = {
-            "predictive_intercept": "predictive_intercept",
-            "linear_sync": "predictive_linear_sync",
-            "full_sync": "predictive_full_sync",
-        }[args.variant]
+    args.method_name = resolve_method_name(args)
     print(f"[ablation] variant={args.variant} method_name={args.method_name}")
 
     env = create_env_and_reset(args)
@@ -1932,7 +1937,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
 
