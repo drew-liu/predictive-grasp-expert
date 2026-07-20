@@ -1,0 +1,6 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.10.0+cu128
+gymnasium==0.29.1
+mani-skill==3.0.0b22
+numpy==2.4.6
+sapien==3.0.2
