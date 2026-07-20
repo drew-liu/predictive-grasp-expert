@@ -1,4 +1,4 @@
-"""State-based expert for grasping a translating and rotating cube in ManiSkill.
+﻿"""State-based expert for grasping a translating and rotating cube in ManiSkill.
 
 The script provides three variants under one predicted contact point/time:
     predictive_intercept: predict the contact state without terminal velocity sync;
@@ -954,7 +954,7 @@ def _max_abs(rows, key):
     return max(vals) if vals else float("nan")
 
 
-def main():
+def build_arg_parser():
     ap = argparse.ArgumentParser(
         description="State-based expert for a translating and rotating cube.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -1101,6 +1101,11 @@ def main():
     ap.add_argument("--marker_radius", type=float, default=0.006)
     ap.add_argument("--marker_z_offset", type=float, default=0.025)
 
+    return ap
+
+
+def main():
+    ap = build_arg_parser()
     args = ap.parse_args()
 
     if args.method_name == "predictive_grasp_expert":
@@ -1924,3 +1929,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
