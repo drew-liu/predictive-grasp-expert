@@ -1103,19 +1103,7 @@ def build_arg_parser():
 
     return ap
 
-
-def main():
-    ap = build_arg_parser()
-    args = ap.parse_args()
-
-    if args.method_name == "predictive_grasp_expert":
-        args.method_name = {
-            "predictive_intercept": "predictive_intercept",
-            "linear_sync": "predictive_linear_sync",
-            "full_sync": "predictive_full_sync",
-        }[args.variant]
-    print(f"[ablation] variant={args.variant} method_name={args.method_name}")
-
+def create_env_and_reset(args):
     env = gym.make(
         "DriftPickCubeAxisYawSyncBottomRefZLock-v0",
         obs_mode="state",
@@ -1132,6 +1120,21 @@ def main():
             cube_z=args.cube_z,
         ),
     )
+    return env
+
+def main():
+    ap = build_arg_parser()
+    args = ap.parse_args()
+
+    if args.method_name == "predictive_grasp_expert":
+        args.method_name = {
+            "predictive_intercept": "predictive_intercept",
+            "linear_sync": "predictive_linear_sync",
+            "full_sync": "predictive_full_sync",
+        }[args.variant]
+    print(f"[ablation] variant={args.variant} method_name={args.method_name}")
+
+    env = create_env_and_reset(args)
 
     uw = env.unwrapped
     dt = getattr(uw, "control_dt", None) or getattr(uw, "control_timestep", None) or (1.0 / 20.0)
@@ -1929,5 +1932,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
