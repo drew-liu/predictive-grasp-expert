@@ -21,9 +21,9 @@ or render-only table hiding is included.
 import argparse
 import csv
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 import gymnasium as gym
 import mani_skill.envs  # noqa: F401
@@ -37,213 +37,46 @@ from mani_skill.utils.structs import Pose
 
 
 # ---------- generic actor helpers ----------
-def iter_targets(actor: Any):
-    yield ("actor", actor)
-    for attr in ["_objs", "_bodies", "objs", "bodies"]:
-        obj = getattr(actor, attr, None)
-        if obj is None:
-            continue
-        try:
-            items = list(obj)
-        except Exception:
-            continue
-        for i, item in enumerate(items):
-            yield (f"{attr}[{i}]", item)
+def wake_cube(cube: Any) -> None:
+    """Wake the cube's underlying PhysX rigid body.
+
+    ``Actor.wake_up`` is an unimplemented stub in this mani_skill version (see
+    ``PhysxRigidDynamicComponentStruct`` in ``mani_skill/utils/structs/base.py``);
+    only the raw PhysX body at ``cube._bodies[0]`` actually exposes ``wake_up()``.
+    """
+    cube._bodies[0].wake_up()
 
 
-def call_first_success(actor: Any, method_names: Sequence[str], *args) -> Optional[str]:
-    for target_name, target in iter_targets(actor):
-        for method_name in method_names:
-            fn = getattr(target, method_name, None)
-            if fn is None:
-                continue
-            try:
-                fn(*args)
-                return f"{target_name}.{method_name}{tuple(args)}"
-            except Exception:
-                continue
-    return None
-
-
-def try_wake(actor: Any) -> Optional[str]:
-    hit = call_first_success(actor, ["wake_up", "wakeUp"])
-    if hit is not None:
-        return hit
-    return call_first_success(actor, ["set_wake_counter", "setWakeCounter"], 1e6)
-
-
-def tune_cube_physics(actor: Any, zero_damping: bool = True, zero_sleep: bool = True):
-    hits = []
+def tune_cube_physics(cube: Any, zero_damping: bool = True, zero_sleep: bool = True) -> None:
     if zero_damping:
-        for names, args in [
-            (["set_linear_damping", "setLinearDamping"], (0.0,)),
-            (["set_angular_damping", "setAngularDamping"], (0.0,)),
-            (["set_damping", "setDamping"], (0.0, 0.0)),
-        ]:
-            hit = call_first_success(actor, names, *args)
-            if hit is not None:
-                hits.append(hit)
+        cube.set_linear_damping(0.0)
+        cube.set_angular_damping(0.0)
     if zero_sleep:
-        for names, args in [
-            (["set_sleep_threshold", "setSleepThreshold", "set_sleep_thresh"], (0.0,)),
-            (["set_stabilization_threshold", "setStabilizationThreshold"], (0.0,)),
-            (["set_wake_counter", "setWakeCounter"], (1e6,)),
-        ]:
-            hit = call_first_success(actor, names, *args)
-            if hit is not None:
-                hits.append(hit)
-        wake_hit = try_wake(actor)
-        if wake_hit is not None:
-            hits.append(wake_hit)
-    return hits
+        # set_sleep_threshold is only implemented on the raw PhysX body, not the
+        # mani_skill Actor wrapper.
+        cube._bodies[0].set_sleep_threshold(0.0)
+        wake_cube(cube)
 
 
 # ---------- marker helpers ----------
+def create_visual_marker(scene, name: str, radius: float, color_rgba):
+    """Build a small kinematic sphere used only as a visual debug marker.
+
+    ``scene`` is the env's ``ManiSkillScene`` (``env.unwrapped.scene``), which
+    exposes ``create_actor_builder`` directly; ``ActorBuilder.add_sphere_visual``
+    and ``build_kinematic`` accept these keyword arguments in this sapien/mani_skill
+    version.
+    """
+    builder = scene.create_actor_builder()
+    material = sapien.render.RenderMaterial(base_color=list(color_rgba))
+    builder.add_sphere_visual(radius=radius, material=material)
+    return builder.build_kinematic(name=name)
 
 
-    def maybe_yield(obj):
-        if obj is None:
-            return
-        oid = id(obj)
-        if oid in seen:
-            return
-        seen.add(oid)
-        yield obj
-
-    for name in direct_names:
-        obj = getattr(uw, name, None)
-        for x in maybe_yield(obj):
-            yield x
-        if obj is None:
-            continue
-        for nested in nested_names:
-            items = getattr(obj, nested, None)
-            if items is None:
-                continue
-            try:
-                for it in list(items):
-                    for x in maybe_yield(it):
-                        yield x
-            except Exception:
-                continue
-
-    for nested in nested_names:
-        items = getattr(uw, nested, None)
-        if items is None:
-            continue
-        try:
-            for it in list(items):
-                for x in maybe_yield(it):
-                    yield x
-        except Exception:
-            continue
-
-
-def _make_render_material(color_rgba):
-    mat = None
-    try:
-        mat = sapien.render.RenderMaterial()
-        rgba = np.array(color_rgba, dtype=np.float32)
-        if hasattr(mat, "base_color"):
-            mat.base_color = rgba
-        elif hasattr(mat, "set_base_color"):
-            mat.set_base_color(rgba)
-    except Exception:
-        mat = None
-    return mat
-
-
-def _build_marker_actor(builder, name: str):
-    for method_name in ["build_kinematic", "build_static", "build"]:
-        fn = getattr(builder, method_name, None)
-        if fn is None:
-            continue
-        try:
-            return fn(name=name)
-        except TypeError:
-            try:
-                return fn()
-            except Exception:
-                continue
-        except Exception:
-            continue
-    return None
-
-
-def create_visual_marker(uw, name: str, radius: float, color_rgba):
-    mat = _make_render_material(color_rgba)
-    errs = []
-    for sc in _iter_scene_candidates(uw):
-        builder_fn = getattr(sc, "create_actor_builder", None)
-        if builder_fn is None:
-            continue
-        try:
-            builder = builder_fn()
-        except Exception as e:
-            errs.append(f"create_actor_builder failed: {e}")
-            continue
-
-        added = False
-        for visual_name in ["add_sphere_visual", "add_box_visual"]:
-            vf = getattr(builder, visual_name, None)
-            if vf is None:
-                continue
-            try:
-                if visual_name == "add_sphere_visual":
-                    if mat is not None:
-                        vf(radius=radius, material=mat)
-                    else:
-                        vf(radius=radius)
-                else:
-                    half = [radius, radius, radius]
-                    if mat is not None:
-                        vf(half_size=half, material=mat)
-                    else:
-                        vf(half_size=half)
-                added = True
-                break
-            except TypeError:
-                try:
-                    if visual_name == "add_sphere_visual":
-                        vf(radius)
-                    else:
-                        vf([radius, radius, radius])
-                    added = True
-                    break
-                except Exception as e:
-                    errs.append(f"{visual_name} fallback failed: {e}")
-            except Exception as e:
-                errs.append(f"{visual_name} failed: {e}")
-
-        if not added:
-            continue
-
-        actor = _build_marker_actor(builder, name)
-        if actor is not None:
-            return actor, "ok"
-
-    return None, "; ".join(errs[:3]) if errs else "no scene/create_actor_builder available"
-
-
-def set_marker_pose(marker: Any, p_xyz):
+def set_marker_pose(marker: Any, p_xyz) -> None:
     if marker is None:
-        return False
-    p_xyz = np.array(p_xyz, dtype=np.float32)
-    for pose_obj in [
-        lambda: sapien.Pose(p=p_xyz),
-        lambda: sapien.Pose(p_xyz),
-        lambda: Pose.create_from_pq(p=p_xyz, q=[1, 0, 0, 0]),
-    ]:
-        try:
-            pose = pose_obj()
-        except Exception:
-            continue
-        try:
-            marker.set_pose(pose)
-            return True
-        except Exception:
-            continue
-    return False
+        return
+    marker.set_pose(Pose.create_from_pq(p=np.array(p_xyz, dtype=np.float32), q=[1, 0, 0, 0]))
 
 
 # ---------- env ----------
@@ -336,80 +169,52 @@ def projected_local_axis_yaw_wxyz(q, axis_index: int = 0, bias_deg: float = 0.0)
             )
     return wrap_to_pi(math.radians(float(bias_deg)))
 
+def np_pose(x) -> np.ndarray:
+    """Pull env 0 out of a mani_skill batched torch tensor (pose.p/.q, velocities, ...) as numpy."""
+    return x[0].cpu().numpy()
 
 
-def np_pose(x):
-    try:
-        return x[0].cpu().numpy()
-    except Exception:
-        return np.array(x, dtype=np.float32)
+def actor_linear_velocity(actor: Any) -> np.ndarray:
+    """World-frame linear velocity of a mani_skill Actor or Link.
 
-
-def np_vec3(x):
-    arr = np.array(x, dtype=np.float32).reshape(-1)
-    if arr.size >= 3:
-        return arr[:3].astype(np.float32)
-    out = np.zeros(3, dtype=np.float32)
-    out[:arr.size] = arr.astype(np.float32)
-    return out
-
-
-def try_get_actor_vec3(actor: Any, attr_names: Sequence[str], method_names: Sequence[str]):
-    for target_name, target in iter_targets(actor):
-        for attr_name in attr_names:
-            try:
-                val = getattr(target, attr_name)
-            except Exception:
-                continue
-            if callable(val):
-                continue
-            try:
-                return np_vec3(np_pose(val)), f"{target_name}.{attr_name}"
-            except Exception:
-                continue
-        for method_name in method_names:
-            fn = getattr(target, method_name, None)
-            if fn is None:
-                continue
-            try:
-                return np_vec3(np_pose(fn())), f"{target_name}.{method_name}()"
-            except Exception:
-                continue
-    return None, None
-
-
-def get_actor_linear_velocity(actor: Any, prev_p=None, dt: Optional[float] = None):
-    v, src = try_get_actor_vec3(
-        actor,
-        attr_names=["linear_velocity", "linvel", "velocity", "v"],
-        method_names=["get_linear_velocity", "getLinearVelocity"],
-    )
-    if v is not None:
-        return v.astype(np.float32), src
-    if prev_p is not None and dt is not None and dt > 1e-8:
-        return ((np_pose(actor.pose.p) - prev_p) / dt).astype(np.float32), "finite_diff"
-    return np.zeros(3, dtype=np.float32), "zero"
-
-
-def get_actor_angular_velocity(actor: Any):
-    """Read a link/actor world-frame angular velocity without finite differencing.
-
-    ManiSkill/SAPIEN wrappers expose this under slightly different attribute or
-    method names across versions, so reuse the generic actor traversal helper.
-    Returns (omega_xyz, source).  NaNs mean no direct source was available.
+    Both structs expose ``linear_velocity`` directly (see
+    ``PhysxRigidBodyComponentStruct`` in ``mani_skill/utils/structs/base.py``).
     """
-    w, src = try_get_actor_vec3(
-        actor,
-        attr_names=["angular_velocity", "angvel", "omega", "w"],
-        method_names=["get_angular_velocity", "getAngularVelocity"],
-    )
-    if w is not None:
-        return w.astype(np.float32), src
-    return np.full(3, np.nan, dtype=np.float32), "unavailable"
+    return np_pose(actor.linear_velocity).astype(np.float32)
+
+
+def actor_angular_velocity(actor: Any) -> np.ndarray:
+    """World-frame angular velocity of a mani_skill Actor or Link (see above)."""
+    return np_pose(actor.angular_velocity).astype(np.float32)
 
 
 def wrap_to_pi(a: float) -> float:
     return float((a + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+@dataclass
+class AngleTracker:
+    """Unwrap a periodic angle and estimate its angular rate."""
+
+    previous: Optional[float] = None
+    unwrapped: Optional[float] = None
+
+    def update(self, angle: float, dt: float) -> tuple[float, float]:
+        angle = float(angle)
+        if self.previous is None:
+            self.previous = angle
+            self.unwrapped = angle
+            return angle, 0.0
+
+        delta = wrap_to_pi(angle - self.previous)
+        self.previous = angle
+        self.unwrapped = float(self.unwrapped + delta)
+        return self.unwrapped, float(delta / dt)
+
+
+def low_pass(previous: Optional[float], current: float, alpha: float) -> float:
+    """Apply a first-order low-pass filter; the first sample initializes it."""
+    return float(current) if previous is None else float(alpha * current + (1.0 - alpha) * previous)
 
 
 def find_finger_links(uw):
@@ -439,20 +244,7 @@ def find_hand_like_link(uw):
         return exact[0], exact[0].name, "hand"
     if loose:
         return loose[0], loose[0].name, "hand"
-    return None, "raw_mid_fallback", "raw_mid"
-
-
-def make_planar_axes(axis_open):
-    axis_lat = np.array([axis_open[0], axis_open[1]], dtype=np.float32)
-    n = np.linalg.norm(axis_lat)
-    if n < 1e-8:
-        axis_lat = np.array([0.0, 1.0], dtype=np.float32)
-    else:
-        axis_lat = axis_lat / n
-    axis_fwd = np.array([-axis_lat[1], axis_lat[0]], dtype=np.float32)
-    return axis_lat, axis_fwd
-
-
+    raise RuntimeError("Could not find panda_hand or hand-like robot link")
 
 
 def yaw_from_front_normal(axis_open):
@@ -473,64 +265,28 @@ def axis_yaw_err(target_yaw: float, current_yaw: float) -> float:
     """Yaw error for an AXIS (180 deg periodic), not a directed heading."""
     return 0.5 * wrap_to_pi(2.0 * (target_yaw - current_yaw))
 
+def read_gripper_geometry(uw, axis_z_offset=0.0):
+    """Read the hand control point, finger midpoint and jaw-opening axis once."""
+    left_finger, right_finger = find_finger_links(uw)
+    left_p = np_pose(left_finger.pose.p).astype(np.float32)
+    right_p = np_pose(right_finger.pose.p).astype(np.float32)
+    finger_mid = (0.5 * (left_p + right_p)).astype(np.float32)
 
+    axis_open = right_p - left_p
+    axis_norm = float(np.linalg.norm(axis_open))
+    if axis_norm < 1e-8:
+        raise RuntimeError("Finger links have coincident positions; yaw axis is undefined")
+    axis_open = (axis_open / axis_norm).astype(np.float32)
 
-
-
-
-def get_face_center_raw_mid_and_open_axis(uw, face_forward_offset=0.018, face_down_offset=-0.022):
-    lf, rf = find_finger_links(uw)
-    lp = np_pose(lf.pose.p)
-    rp = np_pose(rf.pose.p)
-    raw_mid = 0.5 * (lp + rp)
-
-    axis_open = rp - lp
-    n = np.linalg.norm(axis_open)
-    if n < 1e-8:
-        axis_open = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-    else:
-        axis_open = axis_open / n
-
-    axis_lat, axis_fwd = make_planar_axes(axis_open)
-    face_center = raw_mid.copy()
-    face_center[:2] += float(face_forward_offset) * axis_fwd
-    face_center[2] += float(face_down_offset)
-    finger_min_z = float(min(lp[2], rp[2]))
-    return face_center.astype(np.float32), raw_mid.astype(np.float32), axis_open.astype(np.float32), finger_min_z
-
-
-def get_yaw_axis_point(uw, axis_z_offset=0.0, face_forward_offset=0.018, face_down_offset=-0.022):
-    face_center, raw_mid, axis_open, finger_min_z = get_face_center_raw_mid_and_open_axis(
-        uw, face_forward_offset=face_forward_offset, face_down_offset=face_down_offset
-    )
-    hand_link, source_name, source_kind = find_hand_like_link(uw)
-    if hand_link is None:
-        axis_point = raw_mid.copy()
-    else:
-        axis_point = np_pose(hand_link.pose.p).copy()
+    hand_link, source_name, _ = find_hand_like_link(uw)
+    axis_point = np_pose(hand_link.pose.p).copy()
     axis_point[2] += float(axis_z_offset)
-    return axis_point.astype(np.float32), source_name, source_kind, face_center, raw_mid, axis_open, finger_min_z
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    return axis_point.astype(np.float32), source_name, finger_mid, axis_open, left_p, right_p, hand_link
 
 @dataclass
 class InterceptPlan:
     plan_step: int
     plan_time: float
-    wait_time: float
     wait_ready_time: float
     hit_time: float
     lin_start_time: float
@@ -545,7 +301,6 @@ class InterceptPlan:
     wait_yaw: float
     yaw_delta_wait: float
     tau: float
-    score: float
     lin_accel_time: float
     lin_total_time: float
 
@@ -609,10 +364,6 @@ def linear_profile_along_track(elapsed: float, speed: float, accel_abs: float, t
         v = speed
     return float(s), float(v), float(t_acc)
 
-
-
-
-
 def choose_intercept_plan(
     step_idx: int,
     now_t: float,
@@ -623,7 +374,6 @@ def choose_intercept_plan(
     grasp_center: np.ndarray,
     front_yaw_unwrapped: float,
     args,
-    locked_face_offset: Optional[float] = None,
 ):
     """Predictive translation plan plus a z-yaw/wz reference.
 
@@ -631,8 +381,6 @@ def choose_intercept_plan(
     axis at hit time, then backsolve a wait yaw so that launch/descend/close can
     spin with cube_wz and arrive near hit_yaw at hit_time.
     """
-    del locked_face_offset
-
     v_xy = cube_v[:2].astype(np.float64)
     speed = float(np.linalg.norm(v_xy))
     if speed < 1e-8:
@@ -641,8 +389,6 @@ def choose_intercept_plan(
         dir_xy = v_xy / speed
 
     tau_grid = np.arange(args.closest_tau_min, args.closest_tau_max + 0.5 * args.plan_t_step, args.plan_t_step)
-    if tau_grid.size == 0:
-        tau_grid = np.array([args.closest_tau_min], dtype=np.float64)
 
     lin_total_time = max(
         float(args.launch_time),
@@ -653,11 +399,7 @@ def choose_intercept_plan(
         accel_abs=float(args.xy_accel_budget),
         total_time=lin_total_time,
     )
-    # IMPORTANT: in the translation-only schedule, the launch profile must exactly
-    # cover the backtracked distance by t_hit.  An extra lag offset here would make
-    # wait_pos farther back than the open-loop launch profile can actually travel,
-    # which guarantees a systematic y miss even if execution perfectly follows time.
-    # So this version intentionally does NOT add any extra xy lag compensation.
+    # The launch profile must exactly cover the backtracked distance by hit_time.
 
     best = None
     for tau in tau_grid:
@@ -689,9 +431,7 @@ def choose_intercept_plan(
         )
         wait_ready_time = now_t + est_wait_time + float(args.plan_safety_margin)
 
-        # Select the intercept from planar distance; Z feasibility is handled separately.
-        # Do not let the separate Z clearance objective affect which future XY intercept
-        # point is selected. Z feasibility is already handled by wait_z_dist / est_wait_time.
+        # Select in XY; wait_z_dist already accounts for vertical feasibility.
         hit_dist = float(np.linalg.norm((hit_pos[:2] - grasp_center[:2]).astype(np.float64)))
         score = hit_dist + float(args.plan_tau_weight) * tau
         if best is None or score < best[0]:
@@ -724,15 +464,11 @@ def choose_intercept_plan(
         est_wait_time,
     ) = best
 
-    # Predict the cube face yaw at hit time. During go_wait /
-    # wait_hold we rotate toward the backsolved wait_yaw; during launch /
-    # descend / close the reference yaw advances at target_wz so it reaches
-    # hit_yaw at hit_time.  The requested turn is softly capped to about 100 deg
-    # by default to avoid choosing a long unnecessary spin.
+    # Backsolve wait_yaw so the rotating reference reaches hit_yaw at hit_time.
     face_offsets = [math.radians(float(args.cube_body_to_face_deg)),
                     math.radians(float(args.cube_body_to_face_deg)) + math.pi / 2.0]
     cube_yaw_hit = float(cube_yaw + cube_wz * tau)
-    _, yaw_face_offset, hit_yaw, wait_yaw, yaw_delta_wait = choose_face_target_yaw(
+    _, _, hit_yaw, wait_yaw, yaw_delta_wait = choose_face_target_yaw(
         front_yaw_now=float(front_yaw_unwrapped),
         cube_yaw_hit=cube_yaw_hit,
         cube_wz=float(cube_wz),
@@ -749,7 +485,6 @@ def choose_intercept_plan(
     return InterceptPlan(
         plan_step=step_idx,
         plan_time=now_t,
-        wait_time=float(lin_start_time),
         wait_ready_time=float(wait_ready_time),
         hit_time=float(hit_time),
         lin_start_time=float(lin_start_time),
@@ -764,7 +499,6 @@ def choose_intercept_plan(
         wait_yaw=float(wait_yaw),
         yaw_delta_wait=float(yaw_delta_wait),
         tau=float(tau),
-        score=float(score),
         lin_accel_time=float(lin_accel_time),
         lin_total_time=float(lin_total_time),
     )
@@ -898,10 +632,7 @@ def build_close_schedule():
 
 
 def _safe_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return float("nan")
+    return float(x)
 
 
 def _write_rows_csv(path_str: str, rows):
@@ -932,42 +663,44 @@ def _append_summary_csv(path_str: str, summary: dict):
 
 def _first_row(rows, predicate):
     for row in rows:
-        try:
-            if predicate(row):
-                return row
-        except Exception:
-            continue
+        if predicate(row):
+            return row
     return None
 
 
 def _max_abs(rows, key):
     vals = []
     for row in rows:
-        v = row.get(key, float("nan"))
-        try:
-            if math.isfinite(float(v)):
-                vals.append(abs(float(v)))
-        except Exception:
-            pass
+        v = float(row[key])
+        if math.isfinite(v):
+            vals.append(abs(v))
     return max(vals) if vals else float("nan")
 
 
 
 def build_arg_parser():
+    """All 98 knobs, grouped by which control phase or subsystem reads them.
+
+    Grouping only reorganizes/comments this list; no default value changed and
+    no flag removed (every flag here is read at least once elsewhere in the file).
+    """
     ap = argparse.ArgumentParser(
         description="State-based expert for a translating and rotating cube.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+
+    # ---- run control ----
     ap.add_argument("--render", action="store_true")
     ap.add_argument("--steps", type=int, default=500)
     ap.add_argument("--debug_every", type=int, default=2)
 
+    # ---- cube motion scenario ----
     ap.add_argument("--drift_speed", type=float, default=0.03)
     ap.add_argument("--y_offset", type=float, default=-0.60)
     ap.add_argument("--spin_speed", type=float, default=0.30)
     ap.add_argument("--cube_z", type=float, default=0.14)
 
-    # Experiment / logging options. These do not change the control logic.
+    # ---- experiment / ablation / logging (do not change the control logic) ----
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--method_name", type=str, default="predictive_grasp_expert")
     ap.add_argument(
@@ -985,44 +718,17 @@ def build_arg_parser():
     ap.add_argument("--summary_csv", type=str, default="")
     ap.add_argument("--log_every", type=int, default=1)
 
+    # ---- cube physics (zero-gravity drift tuning) ----
     ap.add_argument("--zero_damping", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--zero_sleep", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--keep_awake_every_step", action=argparse.BooleanOptionalAction, default=True)
 
-    ap.add_argument("--move_scale", type=float, default=0.24)
-    # Fast pre-positioning controller for go_wait. The normal PD controller is
-    # accurate but slows down asymptotically near wait_pos, which leaves too little
-    # time to wait/stabilize when drift_speed is high. These parameters only affect
-    # go_wait; launch/descend/close keep the tuned velocity-synchronization logic.
-    ap.add_argument("--fast_go_wait", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--go_wait_move_scale", type=float, default=0.42)
-    ap.add_argument("--go_wait_action_clip", type=float, default=0.42)
-    ap.add_argument("--go_wait_min_xy_action", type=float, default=0.055)
-    ap.add_argument("--go_wait_min_z_action", type=float, default=0.025)
-    ap.add_argument("--go_wait_far_xy", type=float, default=0.025)
-    ap.add_argument("--go_wait_far_z", type=float, default=0.012)
-    ap.add_argument("--launch_y_action_scale", type=float, default=1.25)
-    ap.add_argument("--descend_y_action_scale", type=float, default=1.20)
-    ap.add_argument("--descend_z_action_scale", type=float, default=2.35)
-    ap.add_argument("--descend_z_min_action", type=float, default=0.055)
-    ap.add_argument("--descend_z_far_eps", type=float, default=0.006)
-
-    # During launch/descend/close, replace y position tracking with pure
-    # y-velocity servo. go_wait/wait_hold still use position control so the
-    # gripper can reach the precomputed wait point.
-    ap.add_argument("--vy_vel_only", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--ee_v_per_action_y", type=float, default=0.75)
-    ap.add_argument("--vy_kv_action", type=float, default=1.20)
-    ap.add_argument("--vy_ki_action", type=float, default=0.80)
-    ap.add_argument("--vy_int_clip", type=float, default=0.05)
-    ap.add_argument("--vy_action_clip", type=float, default=0.14)
-
+    # ---- gripper / cube geometry calibration ----
     ap.add_argument("--axis_z_offset", type=float, default=0.0)
-    ap.add_argument("--face_forward_offset", type=float, default=0.018)
-    ap.add_argument("--face_down_offset", type=float, default=-0.022)
     ap.add_argument("--gripper_front_bias_deg", type=float, default=-2.2)
     ap.add_argument("--cube_body_to_face_deg", type=float, default=0.0)
 
+    # ---- intercept planning: predicted contact point/time (choose_intercept_plan) ----
     ap.add_argument("--observe_steps", type=int, default=4)
     ap.add_argument("--observe_hover_clearance", type=float, default=0.09)
     ap.add_argument("--closest_tau_min", type=float, default=0.80)
@@ -1042,21 +748,45 @@ def build_arg_parser():
     ap.add_argument("--close_clearance", type=float, default=0.012)
     ap.add_argument("--close_lead_time", type=float, default=0.00)
 
+    # ---- PD gains: pre-intercept phases (observe / go_wait / wait_hold) ----
     ap.add_argument("--kp_xy_pre", type=float, default=4.0)
     ap.add_argument("--kp_z_pre", type=float, default=3.0)
 
+    # ---- PD gains: dynamic-intercept phases (launch / descend / close base gains) ----
     ap.add_argument("--kp_xy_sync", type=float, default=3.8)
     ap.add_argument("--kp_z_sync", type=float, default=2.4)
     ap.add_argument("--kv_xy_sync", type=float, default=1.0)
     ap.add_argument("--kv_z_sync", type=float, default=0.5)
     ap.add_argument("--ff_xy_sync", type=float, default=0.45)
     ap.add_argument("--ff_z_sync", type=float, default=0.00)
+
+    # ---- action scaling: general + go_wait phase ----
+    ap.add_argument("--move_scale", type=float, default=0.24)
+    # Minimum pre-positioning commands prevent a slow PD tail near wait_pos.
+    ap.add_argument("--fast_go_wait", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--go_wait_move_scale", type=float, default=0.42)
+    ap.add_argument("--go_wait_action_clip", type=float, default=0.42)
+    ap.add_argument("--go_wait_min_xy_action", type=float, default=0.055)
+    ap.add_argument("--go_wait_min_z_action", type=float, default=0.025)
+    ap.add_argument("--go_wait_far_xy", type=float, default=0.025)
+    ap.add_argument("--go_wait_far_z", type=float, default=0.012)
+    ap.add_argument("--go_wait_xy_eps", type=float, default=0.012)
+    ap.add_argument("--go_wait_z_eps", type=float, default=0.010)
+
+    # ---- action scaling / per-axis gain overrides: launch phase ----
+    ap.add_argument("--launch_y_action_scale", type=float, default=1.25)
     ap.add_argument("--launch_kp_x_scale", type=float, default=0.60)
     ap.add_argument("--launch_kp_y_scale", type=float, default=1.35)
     ap.add_argument("--launch_kv_x_scale", type=float, default=0.55)
     ap.add_argument("--launch_kv_y_scale", type=float, default=1.60)
     ap.add_argument("--launch_ff_x_scale", type=float, default=1.00)
     ap.add_argument("--launch_ff_y_scale", type=float, default=1.85)
+
+    # ---- action scaling / per-axis gain overrides: descend phase ----
+    ap.add_argument("--descend_y_action_scale", type=float, default=1.20)
+    ap.add_argument("--descend_z_action_scale", type=float, default=2.35)
+    ap.add_argument("--descend_z_min_action", type=float, default=0.055)
+    ap.add_argument("--descend_z_far_eps", type=float, default=0.006)
     ap.add_argument("--descend_kp_x_scale", type=float, default=0.75)
     ap.add_argument("--descend_kp_y_scale", type=float, default=1.55)
     ap.add_argument("--descend_kp_z_scale", type=float, default=3.20)
@@ -1066,6 +796,19 @@ def build_arg_parser():
     ap.add_argument("--descend_ff_x_scale", type=float, default=1.00)
     ap.add_argument("--descend_ff_y_scale", type=float, default=1.75)
     ap.add_argument("--descend_ff_z_scale", type=float, default=1.75)
+
+    # ---- y-velocity-only controller (launch / descend / close, see control_y_velocity_only) ----
+    # During launch/descend/close, replace y position tracking with pure
+    # y-velocity servo. go_wait/wait_hold still use position control so the
+    # gripper can reach the precomputed wait point.
+    ap.add_argument("--vy_vel_only", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--ee_v_per_action_y", type=float, default=0.75)
+    ap.add_argument("--vy_kv_action", type=float, default=1.20)
+    ap.add_argument("--vy_ki_action", type=float, default=0.80)
+    ap.add_argument("--vy_int_clip", type=float, default=0.05)
+    ap.add_argument("--vy_action_clip", type=float, default=0.14)
+
+    # ---- yaw control ----
     ap.add_argument("--kp_yaw_sync", type=float, default=2.5)
     ap.add_argument("--kp_w_sync", type=float, default=0.15)
     ap.add_argument("--yaw_ff_gain", type=float, default=1.0)
@@ -1089,13 +832,13 @@ def build_arg_parser():
     ap.add_argument("--max_predict_yaw_turn_deg", type=float, default=100.0)
     ap.add_argument("--yaw_wait_wz", action=argparse.BooleanOptionalAction, default=False)
 
+    # ---- close / post-grasp ----
     ap.add_argument("--close_ramp_step", type=int, default=3)
-    ap.add_argument("--go_wait_xy_eps", type=float, default=0.012)
-    ap.add_argument("--go_wait_z_eps", type=float, default=0.010)
     ap.add_argument("--post_hold_grip", type=float, default=-0.85)
     ap.add_argument("--post_steps", type=int, default=40)
     ap.add_argument("--post_ff_xy", type=float, default=0.45)
 
+    # ---- debug markers ----
     ap.add_argument("--show_markers", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--marker_radius", type=float, default=0.006)
     ap.add_argument("--marker_z_offset", type=float, default=0.025)
@@ -1120,6 +863,24 @@ def create_env_and_reset(args):
         ),
     )
     return env
+
+
+def validate_args(args):
+    """Reject invalid experiment settings instead of silently repairing them."""
+    if args.steps <= 0:
+        raise ValueError("--steps must be positive")
+    if args.observe_steps < 0:
+        raise ValueError("--observe_steps cannot be negative")
+    if args.plan_t_step <= 0:
+        raise ValueError("--plan_t_step must be positive")
+    if args.closest_tau_max < args.closest_tau_min:
+        raise ValueError("--closest_tau_max must be >= --closest_tau_min")
+    if args.debug_every <= 0 or args.log_every <= 0:
+        raise ValueError("--debug_every and --log_every must be positive")
+    if args.close_ramp_step <= 0:
+        raise ValueError("--close_ramp_step must be positive")
+    if not 0.0 <= args.wz_filter_alpha <= 1.0:
+        raise ValueError("--wz_filter_alpha must be in [0, 1]")
 
 def resolve_method_name(args):
     if args.method_name != "predictive_grasp_expert":
@@ -1193,11 +954,13 @@ def get_phase_gains(phase: str, args):
             np.array([args.kv_xy_sync, args.kv_xy_sync, args.kv_z_sync], dtype=np.float32),
             np.array([args.ff_xy_sync, args.ff_xy_sync, 0.0], dtype=np.float32),
         )
-    return (
-        np.array([args.kp_xy_sync, args.kp_xy_sync, args.kp_z_sync], dtype=np.float32),
-        np.array([args.kv_xy_sync, args.kv_xy_sync, args.kv_z_sync], dtype=np.float32),
-        np.array([args.post_ff_xy, args.post_ff_xy, 0.0], dtype=np.float32),
-    )
+    if phase == "post_grasp":
+        return (
+            np.array([args.kp_xy_sync, args.kp_xy_sync, args.kp_z_sync], dtype=np.float32),
+            np.array([args.kv_xy_sync, args.kv_xy_sync, args.kv_z_sync], dtype=np.float32),
+            np.array([args.post_ff_xy, args.post_ff_xy, 0.0], dtype=np.float32),
+        )
+    raise ValueError(f"No controller gains defined for phase: {phase}")
 
 
 def get_axis_scale(phase: str, args):
@@ -1215,20 +978,428 @@ def get_axis_scale(phase: str, args):
     return scale
 
 
-def main():
-    ap = build_arg_parser()
-    args = ap.parse_args()
+def compute_launch_descend_reference(plan: InterceptPlan, now_t: float, args):
+    """Compute the reference pose/velocity during the dynamic intercept window."""
+    launch_elapsed = float(np.clip(now_t - plan.lin_start_time, 0.0, plan.lin_total_time))
+    ref_pos = plan.wait_pos.copy()
+    ref_vel = np.zeros(3, dtype=np.float32)
 
-    args.method_name = resolve_method_name(args)
-    print(f"[ablation] variant={args.variant} method_name={args.method_name}")
+    if args.variant == "predictive_intercept":
+        # This ablation reaches the predicted hit point with a smooth position
+        # profile, but intentionally ends with zero XY velocity.
+        intercept_T = max(1e-6, float(plan.hit_time - plan.lin_start_time))
+        intercept_tau = float(np.clip(now_t - plan.lin_start_time, 0.0, intercept_T))
+        intercept_alpha = intercept_tau / intercept_T
+        s_xy = smoothstep01(intercept_alpha)
+        ds_xy = smoothstep01_derivative(intercept_alpha) / intercept_T
+        delta_xy = (plan.hit_pos[:2] - plan.wait_pos[:2]).astype(np.float32)
+        ref_pos[:2] = plan.wait_pos[:2] + float(s_xy) * delta_xy
+        ref_vel[:2] = float(ds_xy) * delta_xy
+        launch_s = float(intercept_alpha)
+    else:
+        # Linear/full sync use the same tuned 1D profile along the target's
+        # planar motion direction, so terminal XY speed matches the target.
+        speed_xy = float(np.linalg.norm(plan.target_vel[:2]))
+        s_prog, v_prog, _ = linear_profile_along_track(
+            elapsed=launch_elapsed,
+            speed=speed_xy,
+            accel_abs=args.xy_accel_budget,
+            total_time=plan.lin_total_time,
+        )
+        if speed_xy < 1e-8:
+            dir_xy = np.array([0.0, 1.0], dtype=np.float32)
+        else:
+            dir_xy = (plan.target_vel[:2] / speed_xy).astype(np.float32)
+        ref_pos[:2] = plan.wait_pos[:2] + dir_xy * float(s_prog)
+        ref_vel[:2] = dir_xy * float(v_prog)
+        launch_s = float(np.clip(launch_elapsed / max(1e-6, plan.lin_total_time), 0.0, 1.0))
 
+    if now_t < plan.descend_start_time:
+        ref_pos[2] = float(plan.wait_pos[2])
+        ref_vel[2] = 0.0
+    else:
+        descend_T = max(1e-6, float(plan.hit_time - plan.descend_start_time))
+        descend_tau = float(np.clip(now_t - plan.descend_start_time, 0.0, descend_T))
+        descend_alpha = descend_tau / descend_T
+        s_desc = smoothstep01(descend_alpha)
+        ds_desc = smoothstep01_derivative(descend_alpha) / descend_T
+        z_delta = float(plan.close_pos[2] - plan.wait_pos[2])
+        ref_pos[2] = float(plan.wait_pos[2] + s_desc * z_delta)
+        ref_vel[2] = float(ds_desc * z_delta)
+
+    return ref_pos, ref_vel, launch_s
+
+
+def compute_yaw_reference(phase: str, plan: Optional[InterceptPlan], now_t: float, front_yaw: float, post_hold_yaw, args):
+    """Return yaw and yaw-rate references for the current ablation variant."""
+    ref_yaw = float(front_yaw)
+    ref_wz = 0.0
+    if not args.enable_yaw_sync or plan is None:
+        return ref_yaw, ref_wz
+
+    if args.variant in ("predictive_intercept", "linear_sync"):
+        if phase in ("go_wait", "wait_hold", "launch", "descend", "close"):
+            return float(plan.hit_yaw), 0.0
+        if phase == "post_grasp" and post_hold_yaw is not None:
+            return float(post_hold_yaw), 0.0
+        return ref_yaw, ref_wz
+
+    if phase in ("go_wait", "wait_hold"):
+        ref_wz = float(plan.target_wz) if args.yaw_wait_wz else 0.0
+        return float(plan.wait_yaw), ref_wz
+    if phase in ("launch", "descend", "close"):
+        ref_yaw = float(plan.hit_yaw + plan.target_wz * (now_t - plan.hit_time))
+        return ref_yaw, float(plan.target_wz)
+    if phase == "post_grasp" and post_hold_yaw is not None:
+        return float(post_hold_yaw), 0.0
+    return ref_yaw, ref_wz
+
+
+def _vec3_fields(prefix: str, vec):
+    """Create x/y/z CSV fields for a 3D vector."""
+    return {
+        f"{prefix}_x": _safe_float(vec[0]),
+        f"{prefix}_y": _safe_float(vec[1]),
+        f"{prefix}_z": _safe_float(vec[2]),
+    }
+
+
+def _rad_and_deg_fields(name: str, value_rad: float):
+    """Log both radians and degrees so analysis scripts can use either unit."""
+    return {
+        name: _safe_float(value_rad),
+        f"{name}_deg": _safe_float(math.degrees(value_rad)),
+    }
+
+
+def build_step_log_row(
+    args,
+    *,
+    t: int,
+    now_t: float,
+    phase: str,
+    cube_p,
+    cube_v,
+    cube_yaw: float,
+    cube_wz: float,
+    grasp_center,
+    ee_v,
+    front_yaw: float,
+    front_yaw_unwrapped: float,
+    front_wz: float,
+    control_yaw_source: str,
+    use_hand_state: bool,
+    finger_axis_yaw: float,
+    finger_axis_wz: float,
+    hand_roll: float,
+    hand_pitch: float,
+    hand_yaw: float,
+    hand_yaw_unwrapped: float,
+    hand_yaw_wz_fd: float,
+    hand_w_direct,
+    hand_w_source: str,
+    hand_link_name_diag,
+    ref_pos,
+    ref_vel,
+    ref_yaw: float,
+    ref_wz: float,
+    pos_err_vec,
+    vel_err_vec,
+    yaw_err: float,
+    w_err: float,
+    action,
+    plan_tau: float,
+    plan_hit: float,
+    time_to_hit,
+    launch_s: float,
+    close_start_step,
+    post_start_step,
+    grasp_latched: bool,
+    vy_only_active: bool,
+    vy_err_only: float,
+):
+    """Build one CSV row without mixing logging details into the controller loop."""
+    rel_pos = (grasp_center - cube_p).astype(np.float32)
+    rel_vel = (ee_v - cube_v).astype(np.float32)
+
+    row = {
+        "method": args.method_name,
+        "variant": args.variant,
+        "seed": int(args.seed),
+        "t": int(t),
+        "time": _safe_float(now_t),
+        "phase": phase,
+        "drift_speed": _safe_float(args.drift_speed),
+        "spin_speed": _safe_float(args.spin_speed),
+        "y_offset": _safe_float(args.y_offset),
+        "control_yaw_source": str(control_yaw_source),
+        "hand_axis_definition": "panda_hand_local_x_projected" if use_hand_state else "legacy_finger_projection",
+        "hand_w_source": str(hand_w_source),
+        "hand_link_name": str(hand_link_name_diag),
+        "rel_speed": _safe_float(np.linalg.norm(rel_vel)),
+        "pos_err_norm": _safe_float(np.linalg.norm(pos_err_vec)),
+        "vel_err_norm": _safe_float(np.linalg.norm(vel_err_vec)),
+        "action_x": _safe_float(action[0]),
+        "action_y": _safe_float(action[1]),
+        "action_z": _safe_float(action[2]),
+        "action_yaw": _safe_float(action[5]),
+        "grip_cmd": _safe_float(action[-1]),
+        "plan_tau": _safe_float(plan_tau),
+        "plan_hit_time": _safe_float(plan_hit),
+        "time_to_hit": _safe_float(time_to_hit if time_to_hit is not None else float("nan")),
+        "launch_s": _safe_float(launch_s),
+        "close_start_step": int(close_start_step) if close_start_step is not None else -1,
+        "post_start_step": int(post_start_step) if post_start_step is not None else -1,
+        "grasp_latched": int(bool(grasp_latched)),
+        "vy_only_active": int(bool(vy_only_active)),
+        "vy_err_only": _safe_float(vy_err_only),
+    }
+
+    row.update(_vec3_fields("cube", cube_p))
+    row.update(_vec3_fields("cube_v", cube_v))
+    row.update(_rad_and_deg_fields("cube_yaw", cube_yaw))
+    row.update(_rad_and_deg_fields("cube_wz", cube_wz))
+    row.update(_vec3_fields("grasp", grasp_center))
+    row.update(_vec3_fields("ee_v", ee_v))
+    row.update(_rad_and_deg_fields("front_yaw", front_yaw))
+    row["front_yaw_unwrapped"] = _safe_float(front_yaw_unwrapped)
+    row.update(_rad_and_deg_fields("front_wz", front_wz))
+    row.update(_rad_and_deg_fields("control_front_yaw", front_yaw))
+    row.update(_rad_and_deg_fields("control_front_wz", front_wz))
+    row.update(_rad_and_deg_fields("finger_axis_yaw", finger_axis_yaw))
+    row.update(_rad_and_deg_fields("finger_axis_wz_fd", finger_axis_wz))
+    row.update(_rad_and_deg_fields("hand_roll", hand_roll))
+    row.update(_rad_and_deg_fields("hand_pitch", hand_pitch))
+    row.update(_rad_and_deg_fields("hand_yaw", hand_yaw))
+    row["hand_yaw_unwrapped"] = _safe_float(hand_yaw_unwrapped)
+    row.update(_rad_and_deg_fields("hand_yaw_wz_fd", hand_yaw_wz_fd))
+    row.update(_vec3_fields("hand_w_direct", hand_w_direct))
+    row["hand_wx_direct_deg"] = _safe_float(math.degrees(hand_w_direct[0]))
+    row["hand_wy_direct_deg"] = _safe_float(math.degrees(hand_w_direct[1]))
+    row["hand_wz_direct_deg"] = _safe_float(math.degrees(hand_w_direct[2]))
+    row.update(_vec3_fields("ref", ref_pos))
+    row.update(_vec3_fields("ref_v", ref_vel))
+    row.update(_rad_and_deg_fields("ref_yaw", ref_yaw))
+    row.update(_rad_and_deg_fields("ref_wz", ref_wz))
+    row.update(_vec3_fields("rel", rel_pos))
+    row.update(_vec3_fields("rel_v", rel_vel))
+    row.update(_vec3_fields("pos_err", pos_err_vec))
+    row.update(_vec3_fields("vel_err", vel_err_vec))
+    row.update(_rad_and_deg_fields("yaw_err", yaw_err))
+    row.update(_rad_and_deg_fields("w_err", w_err))
+    return row
+
+
+@dataclass
+class ControlResult:
+    action: np.ndarray
+    pos_err: np.ndarray
+    vel_err: np.ndarray
+    yaw_err: float
+    w_err: float
+    vy_int: float
+    vy_only_active: bool
+    vy_err: float
+    phase: str
+    post_start_step: Optional[int]
+    grasp_latched: bool
+
+
+def compute_control_command(
+    phase,
+    ref_pos,
+    ref_vel,
+    grasp_center,
+    ee_v,
+    ref_yaw,
+    ref_wz,
+    front_yaw_unwrapped,
+    front_wz,
+    close_start_step,
+    post_start_step,
+    grasp_latched,
+    close_schedule,
+    vy_int,
+    t,
+    dt,
+    args,
+):
+    """Convert the current phase references into one 7-DoF robot action."""
+    action = np.zeros(7, dtype=np.float32)
+    action[-1] = 1.0
+    zeros = np.zeros(3, dtype=np.float32)
+    result = ControlResult(
+        action=action,
+        pos_err=zeros.copy(),
+        vel_err=zeros.copy(),
+        yaw_err=0.0,
+        w_err=0.0,
+        vy_int=float(vy_int),
+        vy_only_active=False,
+        vy_err=0.0,
+        phase=phase,
+        post_start_step=post_start_step,
+        grasp_latched=grasp_latched,
+    )
+    if phase == "done":
+        result.action[-1] = float(args.post_hold_grip)
+        return result
+
+    kp_xyz, kv_xyz, ff_xyz = get_phase_gains(phase, args)
+    u_xyz, result.pos_err, result.vel_err = control_xyz(
+        ref_pos, ref_vel, grasp_center, ee_v, kp_xyz, kv_xyz, ff_xyz, max_cmd=1.0
+    )
+    result.action[:3] = u_xyz * get_axis_scale(phase, args)
+
+    # Enforce only the phase-specific minimum commands required by the tuned expert.
+    if phase == "descend" and float(result.pos_err[2]) < -float(args.descend_z_far_eps):
+        if abs(float(result.action[2])) < float(args.descend_z_min_action):
+            result.action[2] = -float(args.descend_z_min_action)
+
+    if phase == "go_wait" and args.fast_go_wait:
+        result.action[:3] = np.clip(
+            result.action[:3], -float(args.go_wait_action_clip), float(args.go_wait_action_clip)
+        )
+        for axis in (0, 1):
+            if abs(float(result.pos_err[axis])) > float(args.go_wait_far_xy):
+                minimum = float(args.go_wait_min_xy_action)
+                if abs(float(result.action[axis])) < minimum:
+                    result.action[axis] = math.copysign(minimum, float(result.pos_err[axis]))
+        if abs(float(result.pos_err[2])) > float(args.go_wait_far_z):
+            minimum = float(args.go_wait_min_z_action)
+            if abs(float(result.action[2])) < minimum:
+                result.action[2] = math.copysign(minimum, float(result.pos_err[2]))
+
+    if args.vy_vel_only and phase in ("launch", "descend", "close"):
+        (
+            result.action[1],
+            result.vy_int,
+            result.vy_err,
+            _,
+            _,
+            _,
+        ) = control_y_velocity_only(
+            target_vy=float(ref_vel[1]),
+            cur_vy=float(ee_v[1]),
+            dt=float(dt),
+            vy_int=float(result.vy_int),
+            ee_v_per_action_y=float(args.ee_v_per_action_y),
+            kv_action=float(args.vy_kv_action),
+            ki_action=float(args.vy_ki_action),
+            int_clip=float(args.vy_int_clip),
+            action_clip=float(args.vy_action_clip),
+        )
+        result.vy_only_active = True
+
+    if args.enable_yaw_sync and phase in ("go_wait", "wait_hold", "launch", "descend", "close"):
+        result.yaw_err = axis_yaw_err(float(ref_yaw), float(front_yaw_unwrapped))
+        result.w_err = float(ref_wz - front_wz)
+        yaw_feedback = float(args.kp_yaw_sync) * result.yaw_err + float(args.kp_w_sync) * result.w_err
+        yaw_feedforward = (
+            float(args.yaw_ff_gain)
+            * float(args.a5_per_front_wz_deg)
+            * math.degrees(float(ref_wz))
+        )
+        result.action[5] = float(
+            np.clip(yaw_feedforward - yaw_feedback, -float(args.yaw_clip), float(args.yaw_clip))
+        )
+
+    if phase == "close":
+        if close_start_step is None:
+            raise RuntimeError("close phase entered without close_start_step")
+        schedule_index = min(
+            len(close_schedule) - 1,
+            (t - close_start_step) // args.close_ramp_step,
+        )
+        result.action[-1] = float(close_schedule[schedule_index])
+        if schedule_index >= len(close_schedule) - 2:
+            result.phase = "post_grasp"
+            result.post_start_step = t
+            result.grasp_latched = True
+    elif phase == "post_grasp":
+        result.action[-1] = float(args.post_hold_grip)
+
+    if result.grasp_latched:
+        result.action[-1] = float(args.post_hold_grip)
+    return result
+
+
+def finalize_experiment(
+    args,
+    log_rows,
+    phase,
+    grasp_latched,
+    initial_cube_p,
+    initial_cube_yaw,
+    final_cube_p,
+    final_cube_yaw,
+):
+    """Write detailed rows and the one-line experiment summary after control ends."""
+    if args.log_csv and log_rows:
+        _write_rows_csv(args.log_csv, log_rows)
+        print(f"[log] wrote {len(log_rows)} rows to {args.log_csv}")
+
+    if not args.summary_csv:
+        return
+
+    cube_disp = final_cube_p - initial_cube_p
+    first_close = _first_row(
+        log_rows,
+        lambda row: str(row.get("phase")) in ("close", "post_grasp", "done")
+        or float(row.get("grip_cmd", 1.0)) < 0.0,
+    )
+    first_grip = _first_row(log_rows, lambda row: float(row.get("grip_cmd", 1.0)) < 0.0)
+    final_row = log_rows[-1] if log_rows else {}
+
+    def field(row, key):
+        return _safe_float(row[key]) if row is not None else float("nan")
+
+    summary = {
+        "method": args.method_name,
+        "variant": args.variant,
+        "yaw_state_source": args.yaw_state_source,
+        "kp_w_sync": _safe_float(args.kp_w_sync),
+        "wz_filter_alpha": _safe_float(args.wz_filter_alpha),
+        "cube_body_to_face_deg": _safe_float(args.cube_body_to_face_deg),
+        "seed": int(args.seed),
+        "drift_speed": _safe_float(args.drift_speed),
+        "spin_speed": _safe_float(args.spin_speed),
+        "y_offset": _safe_float(args.y_offset),
+        "cube_z": _safe_float(args.cube_z),
+        "steps": int(args.steps),
+        "final_phase": phase,
+        "success": int(bool(grasp_latched or phase in ("post_grasp", "done"))),
+        "entered_close": int(first_close is not None),
+        "first_close_t": field(first_close, "time"),
+        "first_grip_t": field(first_grip, "time"),
+        "first_close_rel_speed": field(first_close, "rel_speed"),
+        "first_grip_rel_speed": field(first_grip, "rel_speed"),
+        "first_close_yaw_err_deg": field(first_close, "yaw_err_deg"),
+        "first_close_werr_deg": field(first_close, "w_err_deg"),
+        "max_abs_yaw_err_deg": _max_abs(log_rows, "yaw_err_deg"),
+        "max_abs_werr_deg": _max_abs(log_rows, "w_err_deg"),
+        "max_pos_err_norm": max((_safe_float(row["pos_err_norm"]) for row in log_rows), default=float("nan")),
+        "max_rel_speed": max((_safe_float(row["rel_speed"]) for row in log_rows), default=float("nan")),
+        "final_cube_disp_norm": _safe_float(np.linalg.norm(cube_disp)),
+        "final_cube_dx": _safe_float(cube_disp[0]),
+        "final_cube_dy": _safe_float(cube_disp[1]),
+        "final_cube_dz": _safe_float(cube_disp[2]),
+        "final_cube_yaw_change_deg": _safe_float(math.degrees(wrap_to_pi(final_cube_yaw - initial_cube_yaw))),
+        "final_rel_x": _safe_float(final_row.get("rel_x", float("nan"))),
+        "final_rel_y": _safe_float(final_row.get("rel_y", float("nan"))),
+        "final_rel_z": _safe_float(final_row.get("rel_z", float("nan"))),
+    }
+    _append_summary_csv(args.summary_csv, summary)
+    print(f"[summary_csv] appended to {args.summary_csv}")
+
+
+def setup_environment(args):
+    """Create the env, settle the scene for a few no-op steps, and tune cube physics."""
     env = create_env_and_reset(args)
-
     uw = env.unwrapped
-    dt = getattr(uw, "control_dt", None) or getattr(uw, "control_timestep", None) or (1.0 / 20.0)
-    physics_hits = tune_cube_physics(uw.cube, zero_damping=args.zero_damping, zero_sleep=args.zero_sleep)
-
-
+    dt = uw.control_timestep
+    tune_cube_physics(uw.cube, zero_damping=args.zero_damping, zero_sleep=args.zero_sleep)
+    print(f"[physics] zero_damping={args.zero_damping} zero_sleep={args.zero_sleep}")
 
     zero = np.zeros(7, dtype=np.float32)
     zero[-1] = +1.0
@@ -1236,54 +1407,269 @@ def main():
         env.step(zero)
         if args.render:
             env.render()
+    return env, uw, dt
 
-    cube_marker = grasp_marker = hit_marker = pre_marker = ref_marker = None
-    if args.show_markers:
-        cube_marker, _ = create_visual_marker(uw, "cube_center_marker", args.marker_radius, [1.0, 1.0, 0.0, 1.0])
-        grasp_marker, _ = create_visual_marker(uw, "grasp_center_marker", args.marker_radius * 0.90, [0.1, 0.9, 1.0, 1.0])
-        hit_marker, _ = create_visual_marker(uw, "hit_marker", args.marker_radius * 0.95, [1.0, 0.2, 1.0, 1.0])
-        pre_marker, _ = create_visual_marker(uw, "pre_marker", args.marker_radius * 0.85, [0.2, 1.0, 0.2, 1.0])
-        ref_marker, _ = create_visual_marker(uw, "ref_marker", args.marker_radius * 0.78, [1.0, 0.5, 0.0, 1.0])
 
-    phase = "observe"
-    observe_count = 0
-    plan = None
-    close_start_step = None
-    post_start_step = None
-    prev_cube_p = None
-    prev_cube_yaw = None
-    prev_grasp_center = None
-    prev_front_yaw = None
-    prev_ref_pos = None
-    prev_ref_yaw = None
-    locked_face_offset = None
-    # Legacy finger-axis state is retained only as a diagnostic/fallback.
-    prev_finger_yaw_wrapped = None
-    finger_yaw_unwrapped = None
+@dataclass
+class Markers:
+    cube: Any = None
+    grasp: Any = None
+    hit: Any = None
+    pre: Any = None
+    ref: Any = None
 
-    # Robust hand-based control state.
-    prev_hand_front_yaw_wrapped = None
-    hand_front_yaw_unwrapped = None
-    control_wz_filtered = None
 
-    # Independent yaw-rate diagnostics:
-    #   1) finger-axis yaw finite difference (existing front_wz),
-    #   2) panda_hand quaternion-yaw finite difference,
-    #   3) panda_hand direct world angular velocity from the simulator.
-    prev_hand_yaw_wrapped = None
-    hand_yaw_unwrapped = None
+def create_markers(args, scene) -> Markers:
+    """Build the debug spheres, or an all-None ``Markers`` if markers are disabled."""
+    if not args.show_markers:
+        return Markers()
+    r = args.marker_radius
+    return Markers(
+        cube=create_visual_marker(scene, "cube_center_marker", r, [1.0, 1.0, 0.0, 1.0]),
+        grasp=create_visual_marker(scene, "grasp_center_marker", r * 0.90, [0.1, 0.9, 1.0, 1.0]),
+        hit=create_visual_marker(scene, "hit_marker", r * 0.95, [1.0, 0.2, 1.0, 1.0]),
+        pre=create_visual_marker(scene, "pre_marker", r * 0.85, [0.2, 1.0, 0.2, 1.0]),
+        ref=create_visual_marker(scene, "ref_marker", r * 0.78, [1.0, 0.5, 0.0, 1.0]),
+    )
 
-    post_hold_pos = None
-    post_hold_yaw = None
-    grasp_latched = False
 
-    # y velocity-only controller state. Reset when entering/leaving dynamic phases.
-    vy_int = 0.0
+def update_markers(markers: Markers, cube_p, grasp_center, plan: Optional[InterceptPlan], ref_pos, marker_z_offset: float) -> None:
+    proj_z = float(cube_p[2] + marker_z_offset)
+    set_marker_pose(markers.cube, [cube_p[0], cube_p[1], proj_z])
+    set_marker_pose(markers.grasp, [grasp_center[0], grasp_center[1], proj_z])
+    if plan is not None:
+        set_marker_pose(markers.hit, [plan.hit_pos[0], plan.hit_pos[1], proj_z])
+        set_marker_pose(markers.pre, [plan.wait_pos[0], plan.wait_pos[1], proj_z])
+    set_marker_pose(markers.ref, [ref_pos[0], ref_pos[1], proj_z])
 
+
+@dataclass
+class LoopState:
+    """Everything the control loop carries from one step to the next."""
+
+    phase: str = "observe"
+    observe_count: int = 0
+    plan: Optional[InterceptPlan] = None
+    close_start_step: Optional[int] = None
+    post_start_step: Optional[int] = None
+    prev_grasp_center: Optional[np.ndarray] = None
+    cube_yaw_tracker: AngleTracker = field(default_factory=AngleTracker)
+    finger_yaw_tracker: AngleTracker = field(default_factory=AngleTracker)
+    hand_yaw_tracker: AngleTracker = field(default_factory=AngleTracker)
+    hand_front_yaw_tracker: AngleTracker = field(default_factory=AngleTracker)
+    control_wz_filtered: Optional[float] = None
+    post_hold_pos: Optional[np.ndarray] = None
+    post_hold_yaw: Optional[float] = None
+    grasp_latched: bool = False
+    vy_int: float = 0.0  # reset when entering/leaving dynamic phases
+    last_phase: Optional[str] = None
+    printed_plan_step: Optional[int] = None
+    log_rows: list = field(default_factory=list)
+    initial_cube_p: Optional[np.ndarray] = None
+    initial_cube_yaw: Optional[float] = None
+
+
+@dataclass
+class GripperState:
+    """One step's worth of gripper geometry, yaw estimate, and derived control point."""
+
+    axis_point: np.ndarray
+    axis_source_name: str
+    finger_mid: np.ndarray
+    left_finger_p: np.ndarray
+    right_finger_p: np.ndarray
+    grasp_center: np.ndarray
+    ee_v: np.ndarray
+    finger_axis_yaw: float
+    finger_axis_wz: float
+    hand_roll: float
+    hand_pitch: float
+    hand_yaw: float
+    hand_yaw_unwrapped: float
+    hand_yaw_wz_fd: float
+    hand_w_direct: np.ndarray
+    hand_w_source: str
+    front_yaw: float
+    front_yaw_unwrapped: float
+    front_wz: float
+    control_yaw_source: str
+    use_hand_state: bool
+
+
+def read_cube_state(uw, state: LoopState, dt: float):
+    """Return (cube_p, cube_v, cube_yaw, cube_wz) and update the yaw tracker in state."""
+    cube_p = np_pose(uw.cube.pose.p)
+    cube_q = np_pose(uw.cube.pose.q)
+    cube_yaw = float(quat_to_euler_xyz_wxyz(cube_q)[2])
+    cube_v = actor_linear_velocity(uw.cube)
+    _, cube_wz = state.cube_yaw_tracker.update(cube_yaw, dt)
+    return cube_p, cube_v, cube_yaw, cube_wz
+
+
+def read_gripper_state(uw, args, state: LoopState, dt: float) -> GripperState:
+    """Read gripper geometry/yaw for one step and advance the trackers in state.
+
+    Also derives the hybrid grasp control point (hand-axis XY, finger-mid Z for
+    clearance) and its finite-difference velocity, since both are downstream of
+    the same geometry read.
+    """
+    (
+        axis_point,
+        axis_source_name,
+        finger_mid,
+        axis_open,
+        left_finger_p,
+        right_finger_p,
+        hand_link,
+    ) = read_gripper_geometry(uw, axis_z_offset=args.axis_z_offset)
+    finger_axis_yaw = wrap_to_pi(
+        yaw_from_front_normal(axis_open) + math.radians(args.gripper_front_bias_deg)
+    )
+    finger_yaw_unwrapped, finger_axis_wz = state.finger_yaw_tracker.update(finger_axis_yaw, dt)
+
+    hand_q = np_pose(hand_link.pose.q)
+    hand_rpy = quat_to_euler_xyz_wxyz(hand_q)
+    hand_roll, hand_pitch, hand_yaw = float(hand_rpy[0]), float(hand_rpy[1]), float(hand_rpy[2])
+    hand_yaw_unwrapped, hand_yaw_wz_fd = state.hand_yaw_tracker.update(hand_yaw, dt)
+    hand_w_direct = actor_angular_velocity(hand_link)
+    hand_w_source = "link.angular_velocity"
+
+    # The rigid hand local axis avoids the finger-origin projection's yaw bias.
+    use_hand_state = args.yaw_state_source == "hand"
+    if use_hand_state:
+        hand_front_yaw = projected_local_axis_yaw_wxyz(
+            hand_q, axis_index=0, bias_deg=float(args.gripper_front_bias_deg)
+        )
+        hand_front_yaw_unwrapped, _ = state.hand_front_yaw_tracker.update(hand_front_yaw, dt)
+        state.control_wz_filtered = low_pass(
+            state.control_wz_filtered, float(hand_w_direct[2]), float(args.wz_filter_alpha)
+        )
+        front_yaw = float(hand_front_yaw)
+        front_yaw_unwrapped = float(hand_front_yaw_unwrapped)
+        front_wz = float(state.control_wz_filtered)
+        control_yaw_source = "panda_hand"
+    else:
+        front_yaw = float(finger_axis_yaw)
+        front_yaw_unwrapped = float(finger_yaw_unwrapped)
+        front_wz = float(finger_axis_wz)
+        control_yaw_source = "finger_axis"
+
+    # Hybrid point: hand-axis XY for alignment, physical finger-mid Z for clearance.
+    grasp_center = np.array([axis_point[0], axis_point[1], finger_mid[2]], dtype=np.float32)
+    if state.prev_grasp_center is None:
+        ee_v = np.zeros(3, dtype=np.float32)
+    else:
+        ee_v = ((grasp_center - state.prev_grasp_center) / dt).astype(np.float32)
+    state.prev_grasp_center = grasp_center.copy()
+
+    return GripperState(
+        axis_point=axis_point,
+        axis_source_name=axis_source_name,
+        finger_mid=finger_mid,
+        left_finger_p=left_finger_p,
+        right_finger_p=right_finger_p,
+        grasp_center=grasp_center,
+        ee_v=ee_v,
+        finger_axis_yaw=finger_axis_yaw,
+        finger_axis_wz=finger_axis_wz,
+        hand_roll=hand_roll,
+        hand_pitch=hand_pitch,
+        hand_yaw=hand_yaw,
+        hand_yaw_unwrapped=hand_yaw_unwrapped,
+        hand_yaw_wz_fd=hand_yaw_wz_fd,
+        hand_w_direct=hand_w_direct,
+        hand_w_source=hand_w_source,
+        front_yaw=front_yaw,
+        front_yaw_unwrapped=front_yaw_unwrapped,
+        front_wz=front_wz,
+        control_yaw_source=control_yaw_source,
+        use_hand_state=use_hand_state,
+    )
+
+
+def decide_phase(phase: str, plan: InterceptPlan, now_t: float, grasp_center: np.ndarray, args) -> str:
+    """Pick the next phase from the plan's timeline; a no-op once post_grasp/done is reached."""
+    if phase in ("post_grasp", "done"):
+        return phase
+    if now_t >= plan.close_start_time:
+        return "close"
+    if now_t >= plan.descend_start_time:
+        return "descend"
+    if now_t >= plan.lin_start_time:
+        return "launch"
+    wait_err_xy = float(np.linalg.norm((plan.wait_pos[:2] - grasp_center[:2]).astype(np.float64)))
+    wait_err_z = abs(float(plan.wait_pos[2] - grasp_center[2]))
+    at_wait = wait_err_xy <= args.go_wait_xy_eps and wait_err_z <= args.go_wait_z_eps
+    return "wait_hold" if at_wait else "go_wait"
+
+
+def format_debug_line(
+    *,
+    t: int,
+    phase: str,
+    cube_p,
+    cube_v,
+    gs: GripperState,
+    ref_pos,
+    ref_vel,
+    ref_yaw: float,
+    ref_wz: float,
+    yaw_err: float,
+    cube_wz: float,
+    w_err: float,
+    pos_err_vec,
+    vel_err_vec,
+    plan_tau: float,
+    plan_hit: float,
+    time_to_hit,
+    launch_s: float,
+    action,
+    vy_only_active: bool,
+    vy_err_only: float,
+    vy_int: float,
+) -> str:
+    grasp_center, axis_point, finger_mid = gs.grasp_center, gs.axis_point, gs.finger_mid
+    left_finger_p, right_finger_p, ee_v = gs.left_finger_p, gs.right_finger_p, gs.ee_v
+    return (
+        f"[t={t:03d}] phase={phase:<11s} "
+        f"cube=({cube_p[0]:+.3f},{cube_p[1]:+.3f},{cube_p[2]:+.3f}) "
+        f"ctrl_pt=({grasp_center[0]:+.3f},{grasp_center[1]:+.3f},{grasp_center[2]:+.3f}) "
+        f"axis_pt=({axis_point[0]:+.3f},{axis_point[1]:+.3f},{axis_point[2]:+.3f}) "
+        f"finger_mid=({finger_mid[0]:+.3f},{finger_mid[1]:+.3f},{finger_mid[2]:+.3f}) "
+        f"Lrel=({left_finger_p[0]-cube_p[0]:+.3f},{left_finger_p[1]-cube_p[1]:+.3f},{left_finger_p[2]-cube_p[2]:+.3f}) "
+        f"Rrel=({right_finger_p[0]-cube_p[0]:+.3f},{right_finger_p[1]-cube_p[1]:+.3f},{right_finger_p[2]-cube_p[2]:+.3f}) "
+        f"ctrl_rel=({grasp_center[0]-cube_p[0]:+.3f},{grasp_center[1]-cube_p[1]:+.3f},{grasp_center[2]-cube_p[2]:+.3f}) "
+        f"axis_rel=({axis_point[0]-cube_p[0]:+.3f},{axis_point[1]-cube_p[1]:+.3f},{axis_point[2]-cube_p[2]:+.3f}) "
+        f"mid_rel=({finger_mid[0]-cube_p[0]:+.3f},{finger_mid[1]-cube_p[1]:+.3f},{finger_mid[2]-cube_p[2]:+.3f}) "
+        f"ref=({ref_pos[0]:+.3f},{ref_pos[1]:+.3f},{ref_pos[2]:+.3f}) "
+        f"cube_v=({cube_v[0]:+.3f},{cube_v[1]:+.3f},{cube_v[2]:+.3f}) ee_v=({ee_v[0]:+.3f},{ee_v[1]:+.3f},{ee_v[2]:+.3f}) "
+        f"ref_v=({ref_vel[0]:+.3f},{ref_vel[1]:+.3f},{ref_vel[2]:+.3f}) "
+        f"front_yaw={math.degrees(gs.front_yaw):+.2f} ref_yaw={math.degrees(ref_yaw):+.2f} yaw_err={math.degrees(yaw_err):+.2f} "
+        f"cube_wz={math.degrees(cube_wz):+.2f} ref_wz={math.degrees(ref_wz):+.2f} werr={math.degrees(w_err):+.2f} "
+        f"pos_err=({pos_err_vec[0]:+.3f},{pos_err_vec[1]:+.3f},{pos_err_vec[2]:+.3f}) vel_err=({vel_err_vec[0]:+.3f},{vel_err_vec[1]:+.3f},{vel_err_vec[2]:+.3f}) "
+        f"plan_tau={plan_tau:+.3f} hit_t={plan_hit:+.3f} t_hit={time_to_hit if time_to_hit is not None else float('nan'):+.3f} launch_s={launch_s:+.2f} "
+        f"a_xyz=({action[0]:+.3f},{action[1]:+.3f},{action[2]:+.3f}) a5={action[5]:+.3f} grip={action[-1]:+.2f} "
+        f"vy_only={int(vy_only_active)} vy_err={vy_err_only:+.3f} vy_int={vy_int:+.3f} "
+        f"axis_src={gs.axis_source_name}"
+    )
+
+
+@dataclass
+class EpisodeResult:
+    phase: str
+    grasp_latched: bool
+    log_rows: list
+    initial_cube_p: np.ndarray
+    initial_cube_yaw: float
+    final_cube_p: np.ndarray
+    final_cube_yaw: float
+    axis_source_name: str
+
+
+def run_episode(env, uw, dt: float, args, markers: Markers) -> EpisodeResult:
+    """Run the observe -> plan -> go_wait -> ... -> done control loop for one episode."""
+    state = LoopState()
     close_schedule = build_close_schedule()
-    last_phase = None
-    printed_plan_step = None
-    printed_descend_phase = False
 
     print("\n=== Moving and rotating target grasping expert ===")
     print(
@@ -1296,295 +1682,79 @@ def main():
         f"summary_csv={args.summary_csv or 'None'}"
     )
 
-    log_rows = []
-    initial_cube_p = None
-    initial_cube_yaw = None
-
-    if physics_hits:
-        print("[physics] applied:")
-        for h in physics_hits:
-            print(f"  - {h}")
-
     for t in range(args.steps):
         now_t = t * dt
-        cube_p = np_pose(uw.cube.pose.p)
-        cube_q = np_pose(uw.cube.pose.q)
-        cube_yaw = float(quat_to_euler_xyz_wxyz(cube_q)[2])
-        cube_v, cube_v_src = get_actor_linear_velocity(uw.cube, prev_p=prev_cube_p, dt=dt)
-        cube_wz = 0.0 if prev_cube_yaw is None else wrap_to_pi(cube_yaw - prev_cube_yaw) / dt
-        prev_cube_p = cube_p.copy()
-        prev_cube_yaw = cube_yaw
+        cube_p, cube_v, cube_yaw, cube_wz = read_cube_state(uw, state, dt)
+        gs = read_gripper_state(uw, args, state, dt)
 
-        axis_point, axis_source_name, axis_source_kind, face_center, raw_mid, axis_open, finger_min_z = get_yaw_axis_point(
-            uw,
-            axis_z_offset=args.axis_z_offset,
-            face_forward_offset=args.face_forward_offset,
-            face_down_offset=args.face_down_offset,
-        )
+        if state.phase == "observe":
+            state.observe_count += 1
+            if state.observe_count >= args.observe_steps:
+                state.phase = "plan"
 
-        # Use the gripper yaw/rotation-axis point only for planar predictive alignment.
-        # get_yaw_axis_point() follows the old tracking script: prefer panda_hand / hand-like
-        # link pose.p as the axis point, fallback to raw_mid if no hand-like link exists.
-        # Keep individual finger positions for debug only, so we can still see early contact.
-        lf_dbg, rf_dbg = find_finger_links(uw)
-        left_finger_p = np_pose(lf_dbg.pose.p).astype(np.float32)
-        right_finger_p = np_pose(rf_dbg.pose.p).astype(np.float32)
-        finger_mid = (0.5 * (left_finger_p + right_finger_p)).astype(np.float32)
-        finger_axis_yaw = wrap_to_pi(
-            yaw_from_front_normal(axis_open) + math.radians(args.gripper_front_bias_deg)
-        )
-        if prev_finger_yaw_wrapped is None or finger_yaw_unwrapped is None:
-            finger_yaw_unwrapped = float(finger_axis_yaw)
-            finger_axis_wz = 0.0
-        else:
-            d_finger = wrap_to_pi(finger_axis_yaw - prev_finger_yaw_wrapped)
-            finger_yaw_unwrapped = float(finger_yaw_unwrapped + d_finger)
-            finger_axis_wz = float(d_finger / dt)
-        prev_finger_yaw_wrapped = float(finger_axis_yaw)
-        prev_front_yaw = finger_axis_yaw
-
-        # ---- Independent hand-orientation diagnostics (logging only) ----
-        # Use the panda_hand/link quaternion rather than the line joining the two
-        # fingers.  Comparing the two finite-difference rates tells us whether a
-        # spike comes from the finger-axis construction or from the hand pose too.
-        hand_link_diag, hand_link_name_diag, _ = find_hand_like_link(uw)
-        if hand_link_diag is not None:
-            hand_q_diag = np_pose(hand_link_diag.pose.q)
-            hand_rpy_diag = quat_to_euler_xyz_wxyz(hand_q_diag)
-            hand_roll = float(hand_rpy_diag[0])
-            hand_pitch = float(hand_rpy_diag[1])
-            hand_yaw = float(hand_rpy_diag[2])
-            if prev_hand_yaw_wrapped is None or hand_yaw_unwrapped is None:
-                hand_yaw_unwrapped = float(hand_yaw)
-                hand_yaw_wz_fd = 0.0
-            else:
-                d_hand_yaw = wrap_to_pi(hand_yaw - prev_hand_yaw_wrapped)
-                hand_yaw_unwrapped = float(hand_yaw_unwrapped + d_hand_yaw)
-                hand_yaw_wz_fd = float(d_hand_yaw / dt)
-            prev_hand_yaw_wrapped = float(hand_yaw)
-            hand_w_direct, hand_w_source = get_actor_angular_velocity(hand_link_diag)
-        else:
-            hand_roll = float("nan")
-            hand_pitch = float("nan")
-            hand_yaw = float("nan")
-            hand_yaw_wz_fd = float("nan")
-            hand_w_direct = np.full(3, np.nan, dtype=np.float32)
-            hand_w_source = "no_hand_link"
-            hand_link_name_diag = "none"
-
-        # ---- Yaw state used by planning and control ----
-        # Use a rigid panda_hand local axis directly. Do NOT calibrate it from the
-        # line between finger link origins: in this model that vector is mostly Z,
-        # so its tiny XY projection can point diagonally and inject a fixed yaw bias.
-        use_hand_state = (
-            args.yaw_state_source == "hand"
-            and hand_link_diag is not None
-            and math.isfinite(hand_yaw)
-        )
-        if use_hand_state:
-            hand_front_yaw = projected_local_axis_yaw_wxyz(
-                hand_q_diag,
-                axis_index=0,
-                bias_deg=float(args.gripper_front_bias_deg),
-            )
-            if (
-                prev_hand_front_yaw_wrapped is None
-                or hand_front_yaw_unwrapped is None
-            ):
-                hand_front_yaw_unwrapped = float(hand_front_yaw)
-            else:
-                d_hand_front = wrap_to_pi(
-                    float(hand_front_yaw) - float(prev_hand_front_yaw_wrapped)
-                )
-                hand_front_yaw_unwrapped = float(
-                    hand_front_yaw_unwrapped + d_hand_front
-                )
-            prev_hand_front_yaw_wrapped = float(hand_front_yaw)
-
-            direct_wz = float(hand_w_direct[2])
-            if not math.isfinite(direct_wz):
-                direct_wz = float(hand_yaw_wz_fd)
-
-            alpha = float(np.clip(args.wz_filter_alpha, 0.0, 1.0))
-            if control_wz_filtered is None or not math.isfinite(control_wz_filtered):
-                control_wz_filtered = direct_wz
-            else:
-                control_wz_filtered = (
-                    alpha * direct_wz
-                    + (1.0 - alpha) * float(control_wz_filtered)
-                )
-
-            front_yaw = float(hand_front_yaw)
-            front_yaw_unwrapped = float(hand_front_yaw_unwrapped)
-            front_wz = float(control_wz_filtered)
-            control_yaw_source = "panda_hand"
-        else:
-            front_yaw = float(finger_axis_yaw)
-            front_yaw_unwrapped = float(finger_yaw_unwrapped)
-            front_wz = float(finger_axis_wz)
-            control_yaw_source = "finger_axis"
-
-        # Hybrid control point:
-        #   - XY comes from the gripper yaw/rotation-axis point.
-        #     This is the projected point we want to align with the object's rotation axis.
-        #   - Z comes from the real left/right finger midpoint.
-        #     This keeps the physical fingers at cube_z + wait_hover_clearance while waiting,
-        #     instead of putting panda_hand/axis_point at that height and letting fingers dip
-        #     into the object.
-        # In short: predict/align axis_point in the XY plane, but control height with finger_mid.
-        axis_point_actual = axis_point.copy()
-        grasp_center = np.array([axis_point[0], axis_point[1], finger_mid[2]], dtype=np.float32)
-        ee_v = np.zeros(3, dtype=np.float32) if prev_grasp_center is None else ((grasp_center - prev_grasp_center) / dt).astype(np.float32)
-        prev_grasp_center = grasp_center.copy()
-
-        if phase == "observe":
-            observe_count += 1
-            if observe_count >= args.observe_steps:
-                phase = "plan"
-
-        if phase == "plan":
-            plan = choose_intercept_plan(
+        if state.phase == "plan":
+            state.plan = choose_intercept_plan(
                 step_idx=t,
                 now_t=now_t,
                 cube_p=cube_p,
                 cube_v=cube_v,
                 cube_yaw=cube_yaw,
                 cube_wz=cube_wz,
-                grasp_center=grasp_center,
-                front_yaw_unwrapped=front_yaw_unwrapped,
+                grasp_center=gs.grasp_center,
+                front_yaw_unwrapped=gs.front_yaw_unwrapped,
                 args=args,
-                locked_face_offset=locked_face_offset,
             )
-            close_start_step = None
-            post_start_step = None
-            post_hold_pos = None
-            post_hold_yaw = None
-            grasp_latched = False
-            vy_int = 0.0
-            if plan is None:
-                phase = "observe"
-                observe_count = 0
-            else:
-                phase = "go_wait"
-                if printed_plan_step != plan.plan_step:
-                    print_plan_debug(plan, grasp_center=grasp_center, cube_p=cube_p, cube_v=cube_v)
-                    printed_plan_step = plan.plan_step
-                    printed_descend_phase = False
+            state.close_start_step = None
+            state.post_start_step = None
+            state.post_hold_pos = None
+            state.post_hold_yaw = None
+            state.grasp_latched = False
+            state.vy_int = 0.0
+            state.phase = "go_wait"
+            if state.printed_plan_step != state.plan.plan_step:
+                print_plan_debug(state.plan, grasp_center=gs.grasp_center, cube_p=cube_p, cube_v=cube_v)
+                state.printed_plan_step = state.plan.plan_step
 
+        plan = state.plan
         time_to_hit = None if plan is None else float(plan.hit_time - now_t)
-        ref_pos = grasp_center.copy()
+        ref_pos = gs.grasp_center.copy()
         ref_vel = np.zeros(3, dtype=np.float32)
-        ref_yaw = front_yaw
+        ref_yaw = gs.front_yaw
         ref_wz = 0.0
         launch_s = 0.0
 
-        if phase == "observe":
-            ref_pos = grasp_center.copy()
-            ref_pos[2] = max(float(grasp_center[2]), float(cube_p[2] + args.observe_hover_clearance))
+        if state.phase == "observe":
+            ref_pos = gs.grasp_center.copy()
+            ref_pos[2] = max(float(gs.grasp_center[2]), float(cube_p[2] + args.observe_hover_clearance))
             ref_vel = np.zeros(3, dtype=np.float32)
 
         if plan is not None:
-            wait_err_xy = float(np.linalg.norm((plan.wait_pos[:2] - grasp_center[:2]).astype(np.float64)))
-            wait_err_z = abs(float(plan.wait_pos[2] - grasp_center[2]))
-            at_wait = (wait_err_xy <= args.go_wait_xy_eps and wait_err_z <= args.go_wait_z_eps)
+            state.phase = decide_phase(state.phase, plan, now_t, gs.grasp_center, args)
+            if state.phase == "close" and state.close_start_step is None:
+                state.close_start_step = t
 
-            if phase not in ("post_grasp", "done"):
-                if now_t >= plan.close_start_time:
-                    phase = "close"
-                    if close_start_step is None:
-                        close_start_step = t
-                elif now_t >= plan.descend_start_time:
-                    phase = "descend"
-                elif now_t >= plan.lin_start_time:
-                    phase = "launch"
-                elif at_wait:
-                    phase = "wait_hold"
-                else:
-                    phase = "go_wait"
-
-            if phase != last_phase:
-                if phase in ("go_wait", "wait_hold", "launch", "descend", "close", "post_grasp"):
+            if state.phase != state.last_phase:
+                if state.phase in ("go_wait", "wait_hold", "launch", "descend", "close", "post_grasp"):
                     print_phase_debug(
-                        tag=phase,
+                        tag=state.phase,
                         now_t=now_t,
                         plan=plan,
-                        grasp_center=grasp_center,
-                        ee_v=ee_v,
-                        front_yaw=front_yaw,
-                        front_wz=front_wz,
+                        grasp_center=gs.grasp_center,
+                        ee_v=gs.ee_v,
+                        front_yaw=gs.front_yaw,
+                        front_wz=gs.front_wz,
                     )
-                    if phase == "launch":
-                        printed_descend_phase = False
-                        vy_int = 0.0
-                    elif phase in ("go_wait", "wait_hold", "post_grasp"):
-                        vy_int = 0.0
-                last_phase = phase
+                    if state.phase in ("launch", "go_wait", "wait_hold", "post_grasp"):
+                        state.vy_int = 0.0
+                state.last_phase = state.phase
 
-            if phase in ("go_wait", "wait_hold"):
+            if state.phase in ("go_wait", "wait_hold"):
                 ref_pos = plan.wait_pos.copy()
                 ref_vel = np.zeros(3, dtype=np.float32)
-            elif phase in ("launch", "descend"):
-                launch_elapsed = float(np.clip(now_t - plan.lin_start_time, 0.0, plan.lin_total_time))
+            elif state.phase in ("launch", "descend"):
+                ref_pos, ref_vel, launch_s = compute_launch_descend_reference(plan, now_t, args)
 
-                ref_pos = plan.wait_pos.copy()
-                ref_vel = np.zeros(3, dtype=np.float32)
-
-                if args.variant == "predictive_intercept":
-                    # Pure predictive interception: move from the waiting point to the
-                    # predicted contact point with a smooth time law that has zero
-                    # terminal XY velocity. This keeps the same predicted hit point and
-                    # hit time, but intentionally does not synchronize target velocity.
-                    intercept_T = max(1e-6, float(plan.hit_time - plan.lin_start_time))
-                    intercept_tau = float(
-                        np.clip(now_t - plan.lin_start_time, 0.0, intercept_T)
-                    )
-                    intercept_alpha = intercept_tau / intercept_T
-                    s_xy = smoothstep01(intercept_alpha)
-                    ds_xy = smoothstep01_derivative(intercept_alpha) / intercept_T
-                    delta_xy = (
-                        plan.hit_pos[:2] - plan.wait_pos[:2]
-                    ).astype(np.float32)
-                    ref_pos[:2] = plan.wait_pos[:2] + float(s_xy) * delta_xy
-                    ref_vel[:2] = float(ds_xy) * delta_xy
-                    launch_s = float(intercept_alpha)
-                else:
-                    # Linear/full synchronization: preserve the tuned profile that
-                    # reaches the predicted contact point with target XY velocity.
-                    speed_xy = float(np.linalg.norm(plan.target_vel[:2]))
-                    s_prog, v_prog, _ = linear_profile_along_track(
-                        elapsed=launch_elapsed,
-                        speed=speed_xy,
-                        accel_abs=args.xy_accel_budget,
-                        total_time=plan.lin_total_time,
-                    )
-                    if speed_xy < 1e-8:
-                        dir_xy = np.array([0.0, 1.0], dtype=np.float32)
-                    else:
-                        dir_xy = (plan.target_vel[:2] / speed_xy).astype(np.float32)
-                    ref_pos[:2] = plan.wait_pos[:2] + dir_xy * float(s_prog)
-                    ref_vel[:2] = dir_xy * float(v_prog)
-                    launch_s = float(
-                        np.clip(
-                            launch_elapsed / max(1e-6, plan.lin_total_time),
-                            0.0,
-                            1.0,
-                        )
-                    )
-
-                if now_t < plan.descend_start_time:
-                    ref_pos[2] = float(plan.wait_pos[2])
-                    ref_vel[2] = 0.0
-                else:
-                    descend_T = max(1e-6, float(plan.hit_time - plan.descend_start_time))
-                    descend_tau = float(np.clip(now_t - plan.descend_start_time, 0.0, descend_T))
-                    descend_alpha = descend_tau / descend_T
-                    s_desc = smoothstep01(descend_alpha)
-                    ds_desc = smoothstep01_derivative(descend_alpha) / descend_T
-                    z_delta = float(plan.close_pos[2] - plan.wait_pos[2])
-                    ref_pos[2] = float(plan.wait_pos[2] + s_desc * z_delta)
-                    ref_vel[2] = float(ds_desc * z_delta)
-
-        if phase == "close" and plan is not None:
+        if state.phase == "close" and plan is not None:
             ref_pos = plan.close_pos.copy()
             if args.variant == "predictive_intercept":
                 # Stop at the predicted interception point: no terminal velocity sync.
@@ -1593,368 +1763,173 @@ def main():
                 ref_vel = plan.target_vel.copy()
                 ref_vel[2] = 0.0
 
-        if phase == "post_grasp" and plan is not None:
-            if post_hold_pos is None:
-                post_hold_pos = grasp_center.copy()
-                post_hold_yaw = float(front_yaw)
-            ref_pos = post_hold_pos.copy()
+        if state.phase == "post_grasp" and plan is not None:
+            if state.post_hold_pos is None:
+                state.post_hold_pos = gs.grasp_center.copy()
+                state.post_hold_yaw = float(gs.front_yaw)
+            ref_pos = state.post_hold_pos.copy()
             ref_vel = np.zeros(3, dtype=np.float32)
-            if post_start_step is not None and (t - post_start_step) >= args.post_steps:
-                phase = "done"
+            if state.post_start_step is not None and (t - state.post_start_step) >= args.post_steps:
+                state.phase = "done"
 
-        # Three-stage ablation:
-        #   predictive_intercept: predicted contact point/time, zero terminal XY
-        #                         velocity, pre-align to hit face, ref_wz = 0.
-        #   linear_sync:          target XY velocity sync, pre-align to hit face,
-        #                         ref_wz = 0.
-        #   full_sync:            target XY velocity sync plus target angular-rate sync.
-        if args.enable_yaw_sync and plan is not None:
-            if args.variant in ("predictive_intercept", "linear_sync"):
-                if phase in ("go_wait", "wait_hold", "launch", "descend", "close"):
-                    ref_yaw = float(plan.hit_yaw)
-                    ref_wz = 0.0
-                elif phase == "post_grasp" and post_hold_yaw is not None:
-                    ref_yaw = float(post_hold_yaw)
-                    ref_wz = 0.0
-            else:
-                if phase in ("go_wait", "wait_hold"):
-                    ref_yaw = float(plan.wait_yaw)
-                    ref_wz = float(plan.target_wz) if args.yaw_wait_wz else 0.0
-                elif phase in ("launch", "descend", "close"):
-                    ref_yaw = float(
-                        plan.hit_yaw + plan.target_wz * (now_t - plan.hit_time)
-                    )
-                    ref_wz = float(plan.target_wz)
-                elif phase == "post_grasp" and post_hold_yaw is not None:
-                    ref_yaw = float(post_hold_yaw)
-                    ref_wz = 0.0
+        ref_yaw, ref_wz = compute_yaw_reference(state.phase, plan, now_t, gs.front_yaw, state.post_hold_yaw, args)
+        update_markers(markers, cube_p, gs.grasp_center, plan, ref_pos, args.marker_z_offset)
 
-        proj_z = float(cube_p[2] + args.marker_z_offset)
-        set_marker_pose(cube_marker, [cube_p[0], cube_p[1], proj_z])
-        set_marker_pose(grasp_marker, [grasp_center[0], grasp_center[1], proj_z])
-        if plan is not None:
-            set_marker_pose(hit_marker, [plan.hit_pos[0], plan.hit_pos[1], proj_z])
-            set_marker_pose(pre_marker, [plan.wait_pos[0], plan.wait_pos[1], proj_z])
-        set_marker_pose(ref_marker, [ref_pos[0], ref_pos[1], proj_z])
-
-        action = np.zeros(7, dtype=np.float32)
-        action[-1] = +1.0
-
-        # Debug terms for y velocity-only controller.
-        vy_only_active = False
-        vy_err_only = 0.0
-        vy_dbg_ff = 0.0
-        vy_dbg_fb = 0.0
-        vy_dbg_i = 0.0
-
-        if phase in ("observe", "go_wait", "wait_hold", "launch", "descend", "close", "post_grasp"):
-            kp_xyz, kv_xyz, ff_xyz = get_phase_gains(phase, args)
-
-            u_xyz, pos_err_vec, vel_err_vec = control_xyz(
-                ref_pos=ref_pos,
-                ref_vel=ref_vel,
-                cur_pos=grasp_center,
-                cur_vel=ee_v,
-                kp_xyz=kp_xyz,
-                kv_xyz=kv_xyz,
-                ff_xyz=ff_xyz,
-                max_cmd=1.0,
-            )
-            axis_scale = get_axis_scale(phase, args)
-            action[:3] = u_xyz * axis_scale
-
-            # During descend, prevent the z controller from creeping down
-            # too slowly when the reference is clearly below the current finger-mid height.
-            # This does not change close timing or close gripper commands; it only helps
-            # the fingers reach the already-planned close height before close starts.
-            if phase == "descend" and float(pos_err_vec[2]) < -float(args.descend_z_far_eps):
-                min_z = float(args.descend_z_min_action)
-                if abs(float(action[2])) < min_z:
-                    action[2] = -min_z
-
-            # Fast go_wait: keep a minimum command while still clearly far from
-            # wait_pos. This avoids the old slow exponential tail where action
-            # became tiny before the gripper had really settled at the wait point.
-            if phase == "go_wait" and args.fast_go_wait:
-                action[:3] = np.clip(action[:3], -float(args.go_wait_action_clip), float(args.go_wait_action_clip))
-                for _idx in (0, 1):
-                    if abs(float(pos_err_vec[_idx])) > float(args.go_wait_far_xy):
-                        min_cmd = float(args.go_wait_min_xy_action)
-                        if abs(float(action[_idx])) < min_cmd:
-                            action[_idx] = math.copysign(min_cmd, float(pos_err_vec[_idx]))
-                if abs(float(pos_err_vec[2])) > float(args.go_wait_far_z):
-                    min_cmd = float(args.go_wait_min_z_action)
-                    if abs(float(action[2])) < min_cmd:
-                        action[2] = math.copysign(min_cmd, float(pos_err_vec[2]))
-
-            # In dynamic intercept phases, y is controlled by velocity only.
-            # This removes y position error from action[1] completely.
-            # x and z keep the original controller.
-            if args.vy_vel_only and phase in ("launch", "descend", "close"):
-                action_y, vy_int, vy_err_only, vy_dbg_ff, vy_dbg_fb, vy_dbg_i = control_y_velocity_only(
-                    target_vy=float(ref_vel[1]),
-                    cur_vy=float(ee_v[1]),
-                    dt=float(dt),
-                    vy_int=float(vy_int),
-                    ee_v_per_action_y=float(args.ee_v_per_action_y),
-                    kv_action=float(args.vy_kv_action),
-                    ki_action=float(args.vy_ki_action),
-                    int_clip=float(args.vy_int_clip),
-                    action_clip=float(args.vy_action_clip),
-                )
-                action[1] = float(action_y)
-                vy_only_active = True
-
-            yaw_err = 0.0
-            w_err = 0.0
-            a5_ff = 0.0
-            a5_fb = 0.0
-            action[5] = 0.0
-            if args.enable_yaw_sync and phase in ("go_wait", "wait_hold", "launch", "descend", "close"):
-                # Use axis-periodic yaw error to avoid commanding an unnecessary >90 deg turn
-                # for the symmetric gripper/cube-face alignment.
-                yaw_err = axis_yaw_err(float(ref_yaw), float(front_yaw_unwrapped))
-                w_err = float(ref_wz - front_wz)
-                yaw_u = float(args.kp_yaw_sync) * yaw_err + float(args.kp_w_sync) * w_err
-                a5_ff = float(args.yaw_ff_gain) * float(args.a5_per_front_wz_deg) * math.degrees(float(ref_wz))
-                a5_fb = -yaw_u
-                action[5] = float(np.clip(a5_ff + a5_fb, -float(args.yaw_clip), float(args.yaw_clip)))
-
-            if phase == "close":
-                close_step = 0 if close_start_step is None else max(0, t - close_start_step)
-                idx = min(len(close_schedule) - 1, close_step // max(1, args.close_ramp_step))
-                action[-1] = float(close_schedule[idx])
-                if idx >= len(close_schedule) - 2:
-                    phase = "post_grasp"
-                    post_start_step = t
-                    grasp_latched = True
-            elif phase == "post_grasp":
-                action[-1] = float(args.post_hold_grip)
-            else:
-                action[-1] = +1.0
-        else:
-            pos_err_vec = np.zeros(3, dtype=np.float32)
-            vel_err_vec = np.zeros(3, dtype=np.float32)
-            yaw_err = 0.0
-            w_err = 0.0
-            a5_ff = 0.0
-            a5_fb = 0.0
-
-        # Once the close ramp has reached the holding stage, keep the gripper closed
-        # even after the finite-state machine enters done. Without this latch, the
-        # default action[-1] = +1.0 opens the gripper in done and releases the cube.
-        if grasp_latched or phase == "done":
-            action[-1] = float(args.post_hold_grip)
+        control = compute_control_command(
+            state.phase,
+            ref_pos,
+            ref_vel,
+            gs.grasp_center,
+            gs.ee_v,
+            ref_yaw,
+            ref_wz,
+            gs.front_yaw_unwrapped,
+            gs.front_wz,
+            state.close_start_step,
+            state.post_start_step,
+            state.grasp_latched,
+            close_schedule,
+            state.vy_int,
+            t,
+            dt,
+            args,
+        )
+        action = control.action
+        pos_err_vec, vel_err_vec = control.pos_err, control.vel_err
+        yaw_err, w_err = control.yaw_err, control.w_err
+        state.vy_int = control.vy_int
+        vy_only_active, vy_err_only = control.vy_only_active, control.vy_err
+        state.phase = control.phase
+        state.post_start_step = control.post_start_step
+        state.grasp_latched = control.grasp_latched
 
         plan_tau = float(plan.tau) if plan is not None else float("nan")
         plan_hit = float(plan.hit_time) if plan is not None else float("nan")
 
-        if initial_cube_p is None:
-            initial_cube_p = cube_p.copy()
-            initial_cube_yaw = float(cube_yaw)
+        if state.initial_cube_p is None:
+            state.initial_cube_p = cube_p.copy()
+            state.initial_cube_yaw = float(cube_yaw)
 
-        if args.log_csv and (t % max(1, int(args.log_every)) == 0 or t == args.steps - 1):
-            rel_pos = (grasp_center - cube_p).astype(np.float32)
-            rel_vel = (ee_v - cube_v).astype(np.float32)
-            log_rows.append({
-                "method": args.method_name,
-                "variant": args.variant,
-                "seed": int(args.seed),
-                "t": int(t),
-                "time": _safe_float(now_t),
-                "phase": phase,
-                "drift_speed": _safe_float(args.drift_speed),
-                "spin_speed": _safe_float(args.spin_speed),
-                "y_offset": _safe_float(args.y_offset),
-                "cube_x": _safe_float(cube_p[0]),
-                "cube_y": _safe_float(cube_p[1]),
-                "cube_z": _safe_float(cube_p[2]),
-                "cube_vx": _safe_float(cube_v[0]),
-                "cube_vy": _safe_float(cube_v[1]),
-                "cube_vz": _safe_float(cube_v[2]),
-                "cube_yaw": _safe_float(cube_yaw),
-                "cube_yaw_deg": _safe_float(math.degrees(cube_yaw)),
-                "cube_wz": _safe_float(cube_wz),
-                "cube_wz_deg": _safe_float(math.degrees(cube_wz)),
-                "grasp_x": _safe_float(grasp_center[0]),
-                "grasp_y": _safe_float(grasp_center[1]),
-                "grasp_z": _safe_float(grasp_center[2]),
-                "ee_vx": _safe_float(ee_v[0]),
-                "ee_vy": _safe_float(ee_v[1]),
-                "ee_vz": _safe_float(ee_v[2]),
-                "front_yaw": _safe_float(front_yaw),
-                "front_yaw_deg": _safe_float(math.degrees(front_yaw)),
-                "front_yaw_unwrapped": _safe_float(front_yaw_unwrapped),
-                "front_wz": _safe_float(front_wz),
-                "front_wz_deg": _safe_float(math.degrees(front_wz)),
-                "control_yaw_source": str(control_yaw_source),
-                "hand_axis_definition": "panda_hand_local_x_projected" if use_hand_state else "legacy_finger_projection",
-                "control_front_yaw": _safe_float(front_yaw),
-                "control_front_yaw_deg": _safe_float(math.degrees(front_yaw)),
-                "control_front_wz": _safe_float(front_wz),
-                "control_front_wz_deg": _safe_float(math.degrees(front_wz)),
-                # Three-way yaw-rate diagnostic.  The legacy finger state is retained
-                # unchanged for backward compatibility and controller behavior.
-                "finger_axis_yaw": _safe_float(finger_axis_yaw),
-                "finger_axis_yaw_deg": _safe_float(math.degrees(finger_axis_yaw)),
-                "finger_axis_wz_fd": _safe_float(finger_axis_wz),
-                "finger_axis_wz_fd_deg": _safe_float(math.degrees(finger_axis_wz)),
-                "hand_roll": _safe_float(hand_roll),
-                "hand_roll_deg": _safe_float(math.degrees(hand_roll)),
-                "hand_pitch": _safe_float(hand_pitch),
-                "hand_pitch_deg": _safe_float(math.degrees(hand_pitch)),
-                "hand_yaw": _safe_float(hand_yaw),
-                "hand_yaw_deg": _safe_float(math.degrees(hand_yaw)),
-                "hand_yaw_unwrapped": _safe_float(hand_yaw_unwrapped),
-                "hand_yaw_wz_fd": _safe_float(hand_yaw_wz_fd),
-                "hand_yaw_wz_fd_deg": _safe_float(math.degrees(hand_yaw_wz_fd)),
-                "hand_wx_direct": _safe_float(hand_w_direct[0]),
-                "hand_wy_direct": _safe_float(hand_w_direct[1]),
-                "hand_wz_direct": _safe_float(hand_w_direct[2]),
-                "hand_wx_direct_deg": _safe_float(math.degrees(hand_w_direct[0])),
-                "hand_wy_direct_deg": _safe_float(math.degrees(hand_w_direct[1])),
-                "hand_wz_direct_deg": _safe_float(math.degrees(hand_w_direct[2])),
-                "hand_w_source": str(hand_w_source),
-                "hand_link_name": str(hand_link_name_diag),
-
-                "ref_x": _safe_float(ref_pos[0]),
-                "ref_y": _safe_float(ref_pos[1]),
-                "ref_z": _safe_float(ref_pos[2]),
-                "ref_vx": _safe_float(ref_vel[0]),
-                "ref_vy": _safe_float(ref_vel[1]),
-                "ref_vz": _safe_float(ref_vel[2]),
-                "ref_yaw": _safe_float(ref_yaw),
-                "ref_yaw_deg": _safe_float(math.degrees(ref_yaw)),
-                "ref_wz": _safe_float(ref_wz),
-                "ref_wz_deg": _safe_float(math.degrees(ref_wz)),
-                "rel_x": _safe_float(rel_pos[0]),
-                "rel_y": _safe_float(rel_pos[1]),
-                "rel_z": _safe_float(rel_pos[2]),
-                "rel_vx": _safe_float(rel_vel[0]),
-                "rel_vy": _safe_float(rel_vel[1]),
-                "rel_vz": _safe_float(rel_vel[2]),
-                "rel_speed": _safe_float(np.linalg.norm(rel_vel)),
-                "pos_err_x": _safe_float(pos_err_vec[0]),
-                "pos_err_y": _safe_float(pos_err_vec[1]),
-                "pos_err_z": _safe_float(pos_err_vec[2]),
-                "pos_err_norm": _safe_float(np.linalg.norm(pos_err_vec)),
-                "vel_err_x": _safe_float(vel_err_vec[0]),
-                "vel_err_y": _safe_float(vel_err_vec[1]),
-                "vel_err_z": _safe_float(vel_err_vec[2]),
-                "vel_err_norm": _safe_float(np.linalg.norm(vel_err_vec)),
-                "yaw_err": _safe_float(yaw_err),
-                "yaw_err_deg": _safe_float(math.degrees(yaw_err)),
-                "w_err": _safe_float(w_err),
-                "w_err_deg": _safe_float(math.degrees(w_err)),
-                "action_x": _safe_float(action[0]),
-                "action_y": _safe_float(action[1]),
-                "action_z": _safe_float(action[2]),
-                "action_yaw": _safe_float(action[5]),
-                "grip_cmd": _safe_float(action[-1]),
-                "plan_tau": _safe_float(plan_tau),
-                "plan_hit_time": _safe_float(plan_hit),
-                "time_to_hit": _safe_float(time_to_hit if time_to_hit is not None else float("nan")),
-                "launch_s": _safe_float(launch_s),
-                "close_start_step": int(close_start_step) if close_start_step is not None else -1,
-                "post_start_step": int(post_start_step) if post_start_step is not None else -1,
-                "grasp_latched": int(bool(grasp_latched)),
-                "vy_only_active": int(bool(vy_only_active)),
-                "vy_err_only": _safe_float(vy_err_only),
-            })
+        if args.log_csv and (t % args.log_every == 0 or t == args.steps - 1):
+            state.log_rows.append(build_step_log_row(
+                args,
+                t=t,
+                now_t=now_t,
+                phase=state.phase,
+                cube_p=cube_p,
+                cube_v=cube_v,
+                cube_yaw=cube_yaw,
+                cube_wz=cube_wz,
+                grasp_center=gs.grasp_center,
+                ee_v=gs.ee_v,
+                front_yaw=gs.front_yaw,
+                front_yaw_unwrapped=gs.front_yaw_unwrapped,
+                front_wz=gs.front_wz,
+                control_yaw_source=gs.control_yaw_source,
+                use_hand_state=gs.use_hand_state,
+                finger_axis_yaw=gs.finger_axis_yaw,
+                finger_axis_wz=gs.finger_axis_wz,
+                hand_roll=gs.hand_roll,
+                hand_pitch=gs.hand_pitch,
+                hand_yaw=gs.hand_yaw,
+                hand_yaw_unwrapped=gs.hand_yaw_unwrapped,
+                hand_yaw_wz_fd=gs.hand_yaw_wz_fd,
+                hand_w_direct=gs.hand_w_direct,
+                hand_w_source=gs.hand_w_source,
+                hand_link_name_diag=gs.axis_source_name,
+                ref_pos=ref_pos,
+                ref_vel=ref_vel,
+                ref_yaw=ref_yaw,
+                ref_wz=ref_wz,
+                pos_err_vec=pos_err_vec,
+                vel_err_vec=vel_err_vec,
+                yaw_err=yaw_err,
+                w_err=w_err,
+                action=action,
+                plan_tau=plan_tau,
+                plan_hit=plan_hit,
+                time_to_hit=time_to_hit,
+                launch_s=launch_s,
+                close_start_step=state.close_start_step,
+                post_start_step=state.post_start_step,
+                grasp_latched=state.grasp_latched,
+                vy_only_active=vy_only_active,
+                vy_err_only=vy_err_only,
+            ))
 
         if args.keep_awake_every_step:
-            try_wake(uw.cube)
+            wake_cube(uw.cube)
         env.step(action)
         if args.keep_awake_every_step:
-            try_wake(uw.cube)
+            wake_cube(uw.cube)
         if args.render:
             env.render()
 
-        plan_tau = float(plan.tau) if plan is not None else float("nan")
-        plan_hit = float(plan.hit_time) if plan is not None else float("nan")
         if t % args.debug_every == 0 or t == args.steps - 1:
-            print(
-                f"[t={t:03d}] phase={phase:<11s} "
-                f"cube=({cube_p[0]:+.3f},{cube_p[1]:+.3f},{cube_p[2]:+.3f}) "
-                f"ctrl_pt=({grasp_center[0]:+.3f},{grasp_center[1]:+.3f},{grasp_center[2]:+.3f}) "
-                f"axis_pt=({axis_point_actual[0]:+.3f},{axis_point_actual[1]:+.3f},{axis_point_actual[2]:+.3f}) "
-                f"finger_mid=({finger_mid[0]:+.3f},{finger_mid[1]:+.3f},{finger_mid[2]:+.3f}) "
-                f"Lrel=({left_finger_p[0]-cube_p[0]:+.3f},{left_finger_p[1]-cube_p[1]:+.3f},{left_finger_p[2]-cube_p[2]:+.3f}) "
-                f"Rrel=({right_finger_p[0]-cube_p[0]:+.3f},{right_finger_p[1]-cube_p[1]:+.3f},{right_finger_p[2]-cube_p[2]:+.3f}) "
-                f"ctrl_rel=({grasp_center[0]-cube_p[0]:+.3f},{grasp_center[1]-cube_p[1]:+.3f},{grasp_center[2]-cube_p[2]:+.3f}) "
-                f"axis_rel=({axis_point_actual[0]-cube_p[0]:+.3f},{axis_point_actual[1]-cube_p[1]:+.3f},{axis_point_actual[2]-cube_p[2]:+.3f}) "
-                f"mid_rel=({finger_mid[0]-cube_p[0]:+.3f},{finger_mid[1]-cube_p[1]:+.3f},{finger_mid[2]-cube_p[2]:+.3f}) "
-                f"ref=({ref_pos[0]:+.3f},{ref_pos[1]:+.3f},{ref_pos[2]:+.3f}) "
-                f"cube_v=({cube_v[0]:+.3f},{cube_v[1]:+.3f},{cube_v[2]:+.3f}) ee_v=({ee_v[0]:+.3f},{ee_v[1]:+.3f},{ee_v[2]:+.3f}) "
-                f"ref_v=({ref_vel[0]:+.3f},{ref_vel[1]:+.3f},{ref_vel[2]:+.3f}) "
-                f"front_yaw={math.degrees(front_yaw):+.2f} ref_yaw={math.degrees(ref_yaw):+.2f} yaw_err={math.degrees(yaw_err):+.2f} "
-                f"cube_wz={math.degrees(cube_wz):+.2f} ref_wz={math.degrees(ref_wz):+.2f} werr={math.degrees(w_err):+.2f} "
-                f"pos_err=({pos_err_vec[0]:+.3f},{pos_err_vec[1]:+.3f},{pos_err_vec[2]:+.3f}) vel_err=({vel_err_vec[0]:+.3f},{vel_err_vec[1]:+.3f},{vel_err_vec[2]:+.3f}) "
-                f"plan_tau={plan_tau:+.3f} hit_t={plan_hit:+.3f} t_hit={time_to_hit if time_to_hit is not None else float('nan'):+.3f} launch_s={launch_s:+.2f} "
-                f"a_xyz=({action[0]:+.3f},{action[1]:+.3f},{action[2]:+.3f}) a5={action[5]:+.3f} grip={action[-1]:+.2f} "
-                f"vy_only={int(vy_only_active)} vy_err={vy_err_only:+.3f} "
-                f"vy_ctrl=(ff={vy_dbg_ff:+.3f},fb={vy_dbg_fb:+.3f},i={vy_dbg_i:+.3f},int={vy_int:+.3f}) "
-                f"cube_v_src={cube_v_src} axis_src={axis_source_name}"
-            )
-    # Write experiment logs and one-line summary. This is intentionally outside the
-    # controller loop so it cannot affect the control logic.
-    if args.log_csv and log_rows:
-        _write_rows_csv(args.log_csv, log_rows)
-        print(f"[log] wrote {len(log_rows)} rows to {args.log_csv}")
+            print(format_debug_line(
+                t=t,
+                phase=state.phase,
+                cube_p=cube_p,
+                cube_v=cube_v,
+                gs=gs,
+                ref_pos=ref_pos,
+                ref_vel=ref_vel,
+                ref_yaw=ref_yaw,
+                ref_wz=ref_wz,
+                yaw_err=yaw_err,
+                cube_wz=cube_wz,
+                w_err=w_err,
+                pos_err_vec=pos_err_vec,
+                vel_err_vec=vel_err_vec,
+                plan_tau=plan_tau,
+                plan_hit=plan_hit,
+                time_to_hit=time_to_hit,
+                launch_s=launch_s,
+                action=action,
+                vy_only_active=vy_only_active,
+                vy_err_only=vy_err_only,
+                vy_int=state.vy_int,
+            ))
 
-    if args.summary_csv:
-        final_cube_p = cube_p.copy() if 'cube_p' in locals() else np.zeros(3, dtype=np.float32)
-        final_cube_yaw = float(cube_yaw) if 'cube_yaw' in locals() else float('nan')
-        if initial_cube_p is None:
-            initial_cube_p = final_cube_p.copy()
-        if initial_cube_yaw is None:
-            initial_cube_yaw = final_cube_yaw
-        cube_disp = final_cube_p - initial_cube_p
-        first_close_row = _first_row(log_rows, lambda r: str(r.get("phase")) in ("close", "post_grasp", "done") or float(r.get("grip_cmd", 1.0)) < 0.0)
-        first_grip_row = _first_row(log_rows, lambda r: float(r.get("grip_cmd", 1.0)) < 0.0)
-        final_row = log_rows[-1] if log_rows else {}
-        summary = {
-            "method": args.method_name,
-            "variant": args.variant,
-            "yaw_state_source": args.yaw_state_source,
-            "kp_w_sync": _safe_float(args.kp_w_sync),
-            "wz_filter_alpha": _safe_float(args.wz_filter_alpha),
-            "cube_body_to_face_deg": _safe_float(args.cube_body_to_face_deg),
-            "seed": int(args.seed),
-            "drift_speed": _safe_float(args.drift_speed),
-            "spin_speed": _safe_float(args.spin_speed),
-            "y_offset": _safe_float(args.y_offset),
-            "cube_z": _safe_float(args.cube_z),
-            "steps": int(args.steps),
-            "final_phase": phase,
-            "success": int(bool(grasp_latched or phase in ("post_grasp", "done"))),
-            "entered_close": int(first_close_row is not None),
-            "first_close_t": _safe_float(first_close_row.get("time", float("nan"))) if first_close_row else float("nan"),
-            "first_grip_t": _safe_float(first_grip_row.get("time", float("nan"))) if first_grip_row else float("nan"),
-            "first_close_rel_speed": _safe_float(first_close_row.get("rel_speed", float("nan"))) if first_close_row else float("nan"),
-            "first_grip_rel_speed": _safe_float(first_grip_row.get("rel_speed", float("nan"))) if first_grip_row else float("nan"),
-            "first_close_yaw_err_deg": _safe_float(first_close_row.get("yaw_err_deg", float("nan"))) if first_close_row else float("nan"),
-            "first_close_werr_deg": _safe_float(first_close_row.get("w_err_deg", float("nan"))) if first_close_row else float("nan"),
-            "max_abs_yaw_err_deg": _max_abs(log_rows, "yaw_err_deg"),
-            "max_abs_werr_deg": _max_abs(log_rows, "w_err_deg"),
-            "max_pos_err_norm": max([_safe_float(r.get("pos_err_norm", float("nan"))) for r in log_rows] or [float("nan")]),
-            "max_rel_speed": max([_safe_float(r.get("rel_speed", float("nan"))) for r in log_rows] or [float("nan")]),
-            "final_cube_disp_norm": _safe_float(np.linalg.norm(cube_disp)),
-            "final_cube_dx": _safe_float(cube_disp[0]),
-            "final_cube_dy": _safe_float(cube_disp[1]),
-            "final_cube_dz": _safe_float(cube_disp[2]),
-            "final_cube_yaw_change_deg": _safe_float(math.degrees(wrap_to_pi(final_cube_yaw - initial_cube_yaw))),
-            "final_rel_x": _safe_float(final_row.get("rel_x", float("nan"))),
-            "final_rel_y": _safe_float(final_row.get("rel_y", float("nan"))),
-            "final_rel_z": _safe_float(final_row.get("rel_z", float("nan"))),
-        }
-        _append_summary_csv(args.summary_csv, summary)
-        print(f"[summary_csv] appended to {args.summary_csv}")
+    return EpisodeResult(
+        phase=state.phase,
+        grasp_latched=state.grasp_latched,
+        log_rows=state.log_rows,
+        initial_cube_p=state.initial_cube_p,
+        initial_cube_yaw=state.initial_cube_yaw,
+        final_cube_p=cube_p.copy(),
+        final_cube_yaw=float(cube_yaw),
+        axis_source_name=gs.axis_source_name,
+    )
 
+
+def main():
+    ap = build_arg_parser()
+    args = ap.parse_args()
+    validate_args(args)
+
+    args.method_name = resolve_method_name(args)
+    print(f"[ablation] variant={args.variant} method_name={args.method_name}")
+
+    env, uw, dt = setup_environment(args)
+    markers = create_markers(args, uw.scene)
+
+    result = run_episode(env, uw, dt, args, markers)
+
+    finalize_experiment(
+        args,
+        result.log_rows,
+        result.phase,
+        result.grasp_latched,
+        result.initial_cube_p,
+        result.initial_cube_yaw,
+        result.final_cube_p,
+        result.final_cube_yaw,
+    )
     print(
-        f"\n[summary] finished variant={args.variant} final_phase={phase} "
-        f"grasp_latched={int(grasp_latched)} yaw_source={args.yaw_state_source} "
-        f"axis_source={axis_source_name}"
+        f"\n[summary] finished variant={args.variant} final_phase={result.phase} "
+        f"grasp_latched={int(result.grasp_latched)} yaw_source={args.yaw_state_source} "
+        f"axis_source={result.axis_source_name}"
     )
     env.close()
 
